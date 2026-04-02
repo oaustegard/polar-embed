@@ -1,99 +1,73 @@
 """Core PolarQuant encoder/decoder."""
 
 import numpy as np
-from typing import Optional, Tuple
+from typing import Tuple
 from polarquant.codebook import lloyd_max_codebook
+from polarquant.packing import pack, unpack, packed_nbytes
 from polarquant.rotation import haar_rotation
 
 
 class CompressedVectors:
-    """Container for quantized vector data with bit-packed index storage.
+    """Container for quantized vector data.
 
-    Indices are stored in packed format to minimize memory. Unpacking
-    happens lazily on first access and is cached for repeated use
-    (e.g., multiple search queries against the same corpus).
+    Indices are stored as uint8 in memory for fast search/decode.
+    Bit-packing is used for serialization (save/load) and for
+    computing the true compressed size (nbytes).
     """
 
-    __slots__ = ("_packed", "_indices_cache", "norms", "d", "bits", "n")
+    __slots__ = ("indices", "norms", "d", "bits", "n", "_x_hat_rot")
 
-    def __init__(
-        self,
-        indices: np.ndarray,
-        norms: np.ndarray,
-        d: int,
-        bits: int,
-        *,
-        packed: bool = False,
-    ):
-        """
-        Args:
-            indices: Either uint8 indices (n, d) or pre-packed bytes.
-            norms: (n,) float32 vector norms.
-            d: Original vector dimension.
-            bits: Quantization bit width.
-            packed: If True, indices are already in packed format.
-        """
-        if packed:
-            self._packed = indices
-        else:
-            self._packed = pack_indices(indices, bits)
-        self._indices_cache = None
+    def __init__(self, indices: np.ndarray, norms: np.ndarray, d: int, bits: int):
+        self.indices = indices  # (n, d) uint8 — unpacked for fast access
         self.norms = norms
         self.d = d
         self.bits = bits
-        self.n = norms.shape[0]
-
-    @property
-    def indices(self) -> np.ndarray:
-        """Unpacked uint8 indices (n, d). Cached after first access."""
-        if self._indices_cache is None:
-            self._indices_cache = unpack_indices(self._packed, self.bits, self.d)
-        return self._indices_cache
+        self.n = indices.shape[0]
+        self._x_hat_rot = None  # cached dequantized rotated vectors
 
     @property
     def nbytes(self) -> int:
-        """Actual memory footprint in bytes (packed indices + norms)."""
-        return self._packed.nbytes + self.norms.nbytes
+        """Packed memory footprint in bytes (honest compression)."""
+        return packed_nbytes(self.n, self.d, self.bits) + self.norms.nbytes
 
     @property
     def nbytes_unpacked(self) -> int:
-        """Memory if indices were stored as uint8 (for comparison)."""
-        return self.n * self.d + self.norms.nbytes
+        """Unpacked memory footprint (what's actually in RAM)."""
+        return self.indices.nbytes + self.norms.nbytes
 
     @property
     def compression_ratio(self) -> float:
-        """Compression vs float32 storage."""
+        """Ratio vs float32 storage (using packed size)."""
         return (self.n * self.d * 4) / self.nbytes
 
     def save(self, path: str):
-        """Save to compressed .npz file (packed format)."""
+        """Save to compressed .npz file with bit-packed indices."""
+        packed_idx = pack(self.indices.ravel(), self.bits)
         np.savez_compressed(
             path,
-            packed=self._packed,
+            packed_indices=packed_idx,
             norms=self.norms,
             d=np.int32(self.d),
             bits=np.int32(self.bits),
+            n=np.int32(self.n),
         )
 
     @classmethod
     def load(cls, path: str) -> "CompressedVectors":
-        """Load from .npz file."""
+        """Load from .npz file, unpacking bit-packed indices."""
         data = np.load(path)
-        if "packed" in data:
-            return cls(
-                data["packed"],
-                data["norms"],
-                int(data["d"]),
-                int(data["bits"]),
-                packed=True,
-            )
-        # Backward compat: old format stored unpacked "indices"
-        return cls(
-            data["indices"],
-            data["norms"],
-            int(data["d"]),
-            int(data["bits"]),
-        )
+        d = int(data["d"])
+        bits = int(data["bits"])
+        n = int(data["n"])
+
+        if "packed_indices" in data:
+            flat = unpack(data["packed_indices"], bits, n * d)
+            indices = flat.reshape(n, d)
+        else:
+            # Backward compat: old format stored unpacked indices
+            indices = data["indices"]
+
+        return cls(indices, data["norms"], d, bits)
 
 
 class PolarQuantizer:
@@ -191,18 +165,6 @@ class PolarQuantizer:
         self.calibrated = True
         return self
 
-    def _rotate(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Normalize and rotate vectors. Returns (X_rot, norms)."""
-        X = np.asarray(X, dtype=np.float32)
-        if X.ndim == 1:
-            X = X[np.newaxis]
-        if X.shape[1] != self.d:
-            raise ValueError(f"Expected d={self.d}, got {X.shape[1]}")
-        norms = np.linalg.norm(X, axis=1)
-        X_unit = X / np.maximum(norms, 1e-8)[:, None]
-        X_rot = X_unit @ self.R.T
-        return X_rot, norms
-
     def encode(self, X: np.ndarray) -> CompressedVectors:
         """
         Quantize a batch of vectors.
@@ -211,9 +173,17 @@ class PolarQuantizer:
             X: (n, d) float array. Need not be unit-normalized.
 
         Returns:
-            CompressedVectors with bit-packed indices and norms.
+            CompressedVectors container with indices and norms.
         """
-        X_rot, norms = self._rotate(X)
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 1:
+            X = X[np.newaxis]
+        if X.shape[1] != self.d:
+            raise ValueError(f"Expected d={self.d}, got {X.shape[1]}")
+
+        norms = np.linalg.norm(X, axis=1)
+        X_unit = X / np.maximum(norms, 1e-8)[:, None]
+        X_rot = X_unit @ self.R.T
 
         if self.calibrated:
             indices = np.empty(X_rot.shape, dtype=np.uint8)
@@ -238,14 +208,13 @@ class PolarQuantizer:
         Returns:
             (n, d) float32 array of approximate vectors.
         """
-        indices = compressed.indices  # lazy unpack + cache
-
         if self.calibrated:
             dim_idx = np.arange(self.d)[np.newaxis, :]
-            X_hat_rot = self.centroids[dim_idx, indices]
+            X_hat_rot = self.centroids[dim_idx, compressed.indices]
         else:
-            X_hat_rot = self.centroids[indices]
+            X_hat_rot = self.centroids[compressed.indices]
 
+        # Don't cache here — decode allocates the full unrotated matrix anyway
         X_hat_unit = X_hat_rot @ self.R
         return X_hat_unit * compressed.norms[:, None]
 
@@ -271,14 +240,7 @@ class PolarQuantizer:
         query = np.asarray(query, dtype=np.float32)
         q_rot = self.R @ query
 
-        idx = compressed.indices  # lazy unpack + cache
-
-        if self.calibrated:
-            dim_idx = np.arange(self.d)[np.newaxis, :]
-            X_hat_rot = self.centroids[dim_idx, idx]
-        else:
-            X_hat_rot = self.centroids[idx]
-
+        X_hat_rot = self._get_x_hat_rot(compressed)
         scores = (X_hat_rot @ q_rot) * compressed.norms
 
         if k >= compressed.n:
@@ -287,6 +249,20 @@ class PolarQuantizer:
             topk_idx = np.argpartition(-scores, k)[:k]
             topk_idx = topk_idx[np.argsort(-scores[topk_idx])]
         return topk_idx, scores[topk_idx]
+
+    def _get_x_hat_rot(self, compressed: CompressedVectors) -> np.ndarray:
+        """Get dequantized vectors in rotated space, with caching."""
+        if compressed._x_hat_rot is not None:
+            return compressed._x_hat_rot
+
+        if self.calibrated:
+            dim_idx = np.arange(self.d)[np.newaxis, :]
+            X_hat_rot = self.centroids[dim_idx, compressed.indices]
+        else:
+            X_hat_rot = self.centroids[compressed.indices]
+
+        compressed._x_hat_rot = X_hat_rot
+        return X_hat_rot
 
     def mse(self, X: np.ndarray) -> float:
         """Compute mean per-vector reconstruction MSE (L2 squared)."""
