@@ -162,3 +162,145 @@ polar-embed is a compression and scoring library, not a database or a search eng
 **Why not just pgVector with 8-bit stored as BYTEA?** You'd still need to scan the full partition for coarse retrieval. pgVector's sequential scan over BYTEA is slower than mmap'd ADC over packed 2-bit because it goes through the Postgres executor, row-by-row.
 
 **Why not quantize norms too?** At 2-bit indices, norms are ~10% of partition file size (0.8 MB vs 38.4 MB at 200K vectors). The savings from quantizing norms are marginal, and any ranking error from norm quantization compounds with the already-lossy 2-bit indices. Keep norms at float32.
+
+
+## S3 as the index store
+
+The .polar files are read-only after generation, flat binary, and partition-sized. This is exactly what object storage is built for. S3 (or R2, GCS, Azure Blob) becomes the canonical store; local SSD is a cache tier.
+
+### Three-tier storage hierarchy
+
+```
+                S3 / R2 (canonical store)
+                    ~40 GB for 200M vectors
+                    ~$0.92/month (S3 Standard)
+                         |
+                         | fetch on demand
+                         v
+                Local SSD (cache tier)
+                    ~4 GB for 20 hot partitions
+                    LRU eviction by atime
+                         |
+                         | mmap
+                         v
+                OS page cache (hot tier)
+                    ~2 GB for actively-queried partitions
+                    Managed by kernel
+```
+
+### Economics
+
+| Resource | Cost |
+|----------|------|
+| S3 Standard (40 GB) | $0.92/month |
+| S3 Infrequent Access (40 GB) | $0.50/month |
+| Cloudflare R2 (40 GB, no egress) | $0.60/month |
+| S3 GET requests (1000/day) | $0.01/month |
+| S3 transfer (same region) | $0.00 |
+
+The entire Semantic Scholar coarse index costs less than a dollar a month to host.
+
+### Cold query latency
+
+When a user queries a partition that isn't on local SSD:
+
+| Partition | S3 fetch (multipart 8x) | ADC scan | Total cold | Warm (mmap) |
+|-----------|------------------------|----------|------------|-------------|
+| 50K vectors (10 MB) | 20 ms | 25 ms | **45 ms** | 25 ms |
+| 200K vectors (39 MB) | 78 ms | 100 ms | **178 ms** | 100 ms |
+| 500K vectors (98 MB) | 196 ms | 250 ms | **446 ms** | 250 ms |
+
+At the target partition size (200K), even a cold query is under 200ms. Multipart download (8 concurrent S3 range GETs) is key — a single GET would be 390ms.
+
+### Local SSD cache management
+
+The cache is just a directory of .polar files with LRU eviction:
+
+```python
+# Pseudocode — not part of polar-embed
+class PartitionCache:
+    def __init__(self, cache_dir: str, max_bytes: int, s3_bucket: str):
+        self.cache_dir = cache_dir
+        self.max_bytes = max_bytes
+        self.s3 = boto3.client("s3")
+        self.bucket = s3_bucket
+
+    def get(self, partition_key: str) -> Path:
+        local_path = self.cache_dir / f"{partition_key}.polar"
+        if local_path.exists():
+            local_path.touch()  # update atime for LRU
+            return local_path
+        self._evict_if_needed()
+        self._download(partition_key, local_path)
+        return local_path
+
+    def _download(self, key: str, path: Path):
+        # Multipart download for files > 8 MB
+        self.s3.download_file(self.bucket, f"partitions/{key}.polar", str(path))
+
+    def _evict_if_needed(self):
+        # Remove oldest-accessed files until under budget
+        files = sorted(self.cache_dir.glob("*.polar"), key=lambda p: p.stat().st_atime)
+        total = sum(f.stat().st_size for f in files)
+        while total > self.max_bytes and files:
+            victim = files.pop(0)
+            total -= victim.stat().st_size
+            victim.unlink()
+```
+
+This is ~30 lines of application code. polar-embed doesn't need to know about S3 — it just reads .polar files from wherever they are.
+
+### Prefetching via taxonomy
+
+Semantic Scholar's field-of-study taxonomy is a tree. When a user selects a broad field, the sub-fields they'll likely drill into are predictable:
+
+```
+Computer Science                    ← user selects this
+├── Artificial Intelligence         ← prefetch these
+│   ├── Machine Learning           ← and these
+│   ├── NLP
+│   └── Computer Vision
+├── Systems
+├── Theory
+└── ...
+```
+
+On the first query, kick off background downloads of sibling and child partitions. By the time the user narrows their search, the partition is already on local SSD. The .polar file sizes (10-40 MB each) make this practical — prefetching 5 siblings is ~200 MB, downloadable in under a second.
+
+### Deployment topology
+
+```
+┌──────────────────────────────────────────────────┐
+│              Application Server                   │
+│                                                   │
+│  ┌─────────────┐  ┌──────────────────────┐       │
+│  │ Partition    │  │ polar-embed          │       │
+│  │ Cache (SSD)  │──│ PackedVectors.mmap() │       │
+│  │ 4-20 GB      │  │ ADC coarse scan      │       │
+│  └──────┬───────┘  └──────────┬───────────┘       │
+│         │                     │                    │
+│         │ miss                │ 200 candidate IDs  │
+│         v                     v                    │
+│  ┌──────────────┐  ┌──────────────────────┐       │
+│  │ S3 / R2      │  │ pgVector             │       │
+│  │ (all .polar) │  │ (8-bit for rerank)   │       │
+│  └──────────────┘  └──────────────────────┘       │
+└──────────────────────────────────────────────────┘
+```
+
+The app server needs:
+- **4-20 GB local SSD** for the partition cache (size based on working set)
+- **Network access** to S3 (same region, ~100 MB/s+) and pgVector
+- **No GPU.** The entire coarse scan is NumPy on CPU.
+
+### Regeneration
+
+When the corpus updates (Semantic Scholar releases weekly), regenerate affected partitions:
+
+1. Encode new/updated documents with the same `PolarQuantizer(d=768, bits=8, seed=42)`
+2. Rebuild affected partition .polar files (2-bit derived from 8-bit)
+3. Upload to S3, replacing the old files
+4. Invalidate local cache entries (delete the old .polar files on SSD, or use versioned S3 keys)
+5. Next query fetches the updated partition
+
+The quantizer seed doesn't change, so existing 8-bit encodings in pgVector are still compatible. Only new documents need encoding.
