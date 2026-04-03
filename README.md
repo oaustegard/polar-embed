@@ -247,8 +247,8 @@ At 3-bit, polar-embed achieves 72-80% R@10 vs ~40% for naive scalar quantization
 ## Installation
 
 ```bash
-pip install polar-embed                  # from PyPI (when published)
-pip install -e ".[dev]"                  # development: + pytest, pytest-cov
+pip install git+https://github.com/oaustegard/polar-embed.git   # install from GitHub
+pip install -e ".[dev]"                  # local development: + pytest, pytest-cov
 pip install -e ".[bench]"               # benchmarking: + faiss-cpu, sentence-transformers
 ```
 

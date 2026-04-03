@@ -5,7 +5,10 @@ This guide shows how to use polar-embed for embedding compression in production 
 ## Prerequisites
 
 ```bash
-pip install polar-embed psycopg2-binary numpy
+pip install git+https://github.com/oaustegard/polar-embed.git psycopg2-binary numpy
+# Or from a local clone:
+pip install -e /path/to/polar-embed
+
 # For generating embeddings:
 pip install sentence-transformers
 ```
