@@ -1,12 +1,12 @@
 # Scale Architecture: Partitioned Two-Tier Retrieval
 
-How polar-embed serves 100M+ vector corpora with sub-200ms query latency, no GPU, and no training.
+How remex serves 100M+ vector corpora with sub-200ms query latency, no GPU, and no training.
 
 ## The problem
 
 Large embedding corpora (Semantic Scholar's 200M abstracts, patent databases, legal archives) don't fit in RAM as float32 and can't be scanned linearly at interactive speeds. Traditional solutions (FAISS IVF, HNSW) require training on the data and maintaining specialized index structures.
 
-polar-embed's value is **zero-training, deterministic, portable compression**. This document describes how to use that property at scale.
+remex's value is **zero-training, deterministic, portable compression**. This document describes how to use that property at scale.
 
 ## Core insight: partition by metadata, not by geometry
 
@@ -42,13 +42,13 @@ At 200M total abstracts with ~200 fine-grained fields, average partition is ~1M 
        v
   Partition by field-of-study
        |
-       +---> Encode (PolarQuantizer, 8-bit)
+       +---> Encode (Quantizer, 8-bit)
        |       |
        |       +---> Store 8-bit in pgVector
        |       |     (fine rerank source)
        |       |
        |       +---> Derive 2-bit packed
-       |             Save as .polar file
+       |             Save as .arrow file
        |             (one per partition)
        |
        +---> Metadata index
@@ -61,7 +61,7 @@ At 200M total abstracts with ~200 fine-grained fields, average partition is ~1M 
   1. User selects domain / field filter
        |
        v
-  2. mmap the partition's .polar file
+  2. mmap the partition's .arrow file
      (instant if already in OS page cache)
        |
        v
@@ -90,7 +90,7 @@ The partition files are flat binary arrays. Memory-mapping them gives:
 
 An application-level cache would reimplement all of this, worse.
 
-## File format: `.polar`
+## File format: `.arrow` (Arrow IPC)
 
 A flat, mmap-friendly binary format. No compression, no container overhead.
 
@@ -113,10 +113,10 @@ The entire file can be mmap'd. `unpack_rows` computes byte offsets into the pack
 
 | Tier | Storage | Bit-width | Purpose | Access pattern |
 |------|---------|-----------|---------|----------------|
-| Coarse | .polar file (mmap) | 2-bit packed | Full-partition scan | Sequential, chunked |
+| Coarse | .arrow file (mmap) | 2-bit packed | Full-partition scan | Sequential, chunked |
 | Fine | pgVector (or any DB) | 8-bit | Candidate rerank | Random access, ~200 rows |
 
-The quantizer is shared: same `PolarQuantizer(d=768, bits=8, seed=42)` produces the 8-bit encoding. The 2-bit coarse codes are derived by right-shifting (Matryoshka property). This means:
+The quantizer is shared: same `Quantizer(d=768, bits=8, seed=42)` produces the 8-bit encoding. The 2-bit coarse codes are derived by right-shifting (Matryoshka property). This means:
 
 - **One encode pass** in the batch pipeline
 - **Deterministic derivation** of coarse from fine (no separate codebook)
@@ -128,7 +128,7 @@ A deployment serving all of Semantic Scholar (200M abstracts, ~200 partitions):
 
 | Resource | Estimate |
 |----------|----------|
-| .polar files on disk | ~200 x 200 MB avg = **40 GB** |
+| .arrow files on disk | ~200 x 200 MB avg = **40 GB** |
 | RAM for hot partitions (10 warm) | ~2 GB page cache |
 | pgVector 8-bit storage | 200M x 768 bytes = **153 GB** |
 | pgVector norms | 200M x 4 bytes = **800 MB** |
@@ -136,22 +136,22 @@ A deployment serving all of Semantic Scholar (200M abstracts, ~200 partitions):
 
 This fits on a single beefy VM (256 GB RAM, 500 GB SSD). No GPU. No distributed index. No training pipeline.
 
-## What polar-embed provides vs. what the developer builds
+## What remex provides vs. what the developer builds
 
-**polar-embed provides:**
-- `PolarQuantizer`: encode, derive coarse codes, score
+**remex provides:**
+- `Quantizer`: encode, derive coarse codes, score
 - `PackedVectors`: packed-in-memory storage, `unpack_rows()`, mmap-backed load
-- `.polar` file format: save/load with mmap support
+- `.arrow` (Arrow IPC) file format: save/load with mmap support
 - ADC scoring that works against packed/mmap'd data
 
 **The developer builds:**
 - Partition strategy (metadata -> partition mapping)
-- Batch pipeline (encode corpus, generate .polar files, populate pgVector)
-- Partition router (user query -> which .polar file to mmap)
+- Batch pipeline (encode corpus, generate .arrow files, populate pgVector)
+- Partition router (user query -> which .arrow file to mmap)
 - DB client (fetch 8-bit rows for fine rerank)
 - Application server, API, etc.
 
-polar-embed is a compression and scoring library, not a database or a search engine.
+remex is a compression and scoring library, not a database or a search engine.
 
 ## Alternatives considered
 
@@ -166,7 +166,7 @@ polar-embed is a compression and scoring library, not a database or a search eng
 
 ## S3 as the index store
 
-The .polar files are read-only after generation, flat binary, and partition-sized. This is exactly what object storage is built for. S3 (or R2, GCS, Azure Blob) becomes the canonical store; local SSD is a cache tier.
+The .arrow files are read-only after generation, flat binary, and partition-sized. This is exactly what object storage is built for. S3 (or R2, GCS, Azure Blob) becomes the canonical store; local SSD is a cache tier.
 
 ### Three-tier storage hierarchy
 
@@ -214,10 +214,10 @@ At the target partition size (200K), even a cold query is under 200ms. Multipart
 
 ### Local SSD cache management
 
-The cache is just a directory of .polar files with LRU eviction:
+The cache is just a directory of .arrow files with LRU eviction:
 
 ```python
-# Pseudocode — not part of polar-embed
+# Pseudocode — not part of remex
 class PartitionCache:
     def __init__(self, cache_dir: str, max_bytes: int, s3_bucket: str):
         self.cache_dir = cache_dir
@@ -248,7 +248,7 @@ class PartitionCache:
             victim.unlink()
 ```
 
-This is ~30 lines of application code. polar-embed doesn't need to know about S3 — it just reads .polar files from wherever they are.
+This is ~30 lines of application code. remex doesn't need to know about S3 — it just reads .arrow files from wherever they are.
 
 ### Prefetching via taxonomy
 
@@ -265,7 +265,7 @@ Computer Science                    ← user selects this
 └── ...
 ```
 
-On the first query, kick off background downloads of sibling and child partitions. By the time the user narrows their search, the partition is already on local SSD. The .polar file sizes (10-40 MB each) make this practical — prefetching 5 siblings is ~200 MB, downloadable in under a second.
+On the first query, kick off background downloads of sibling and child partitions. By the time the user narrows their search, the partition is already on local SSD. The .arrow file sizes (10-40 MB each) make this practical — prefetching 5 siblings is ~200 MB, downloadable in under a second.
 
 ### Deployment topology
 
@@ -274,7 +274,7 @@ On the first query, kick off background downloads of sibling and child partition
 │              Application Server                   │
 │                                                   │
 │  ┌─────────────┐  ┌──────────────────────┐       │
-│  │ Partition    │  │ polar-embed          │       │
+│  │ Partition    │  │ remex          │       │
 │  │ Cache (SSD)  │──│ PackedVectors.mmap() │       │
 │  │ 4-20 GB      │  │ ADC coarse scan      │       │
 │  └──────┬───────┘  └──────────┬───────────┘       │
@@ -293,14 +293,29 @@ The app server needs:
 - **Network access** to S3 (same region, ~100 MB/s+) and pgVector
 - **No GPU.** The entire coarse scan is NumPy on CPU.
 
-### Regeneration
+### Regeneration via content-hashed keys
 
 When the corpus updates (Semantic Scholar releases weekly), regenerate affected partitions:
 
-1. Encode new/updated documents with the same `PolarQuantizer(d=768, bits=8, seed=42)`
-2. Rebuild affected partition .polar files (2-bit derived from 8-bit)
-3. Upload to S3, replacing the old files
-4. Invalidate local cache entries (delete the old .polar files on SSD, or use versioned S3 keys)
-5. Next query fetches the updated partition
+1. Encode new/updated documents with the same `Quantizer(d=768, bits=8, seed=42)`
+2. Rebuild affected partition .arrow files (2-bit derived from 8-bit)
+3. Upload to S3 with content-hashed key: `v1/{sha256[:16]}.arrow`
+4. Update the manifest (`s3://bucket/manifest.json`) to point partition name → new key
+5. App fetches updated manifest on next startup or periodic check
+6. Next query for that partition downloads the new file; old file stays on SSD until LRU evicts
+
+No explicit cache purge needed. Old and new versions coexist on S3 during rollover. The manifest is the single source of truth.
+
+```json
+{
+  "format_version": 1,
+  "quantizer": {"d": 768, "bits": 8, "seed": 42},
+  "generated": "2026-04-07T00:00:00Z",
+  "partitions": {
+    "cs.AI": {"key": "v1/a3f8c1d2e9b74f01.arrow", "n": 185000, "bytes": 35520000},
+    "cs.CL": {"key": "v1/7b2e4f91cc083a22.arrow", "n": 210000, "bytes": 40320000}
+  }
+}
+```
 
 The quantizer seed doesn't change, so existing 8-bit encodings in pgVector are still compatible. Only new documents need encoding.
