@@ -106,11 +106,11 @@ polar-embed is not the best tool for every compression scenario. Here's where it
 
 - **Calibration helps less than expected.** On real embeddings, calibration adds +1-3% R@10 at 3-4 bits. It doesn't close the gap with FAISS. On synthetic data with uniform cluster spread, calibration provides negligible benefit.
 
-- **Linear scan only.** Search is brute-force dot product over all vectors. No sublinear indexing (IVF, HNSW). At >100k vectors, latency grows linearly. For large-scale use, combine with a coarse retrieval stage.
+- **Linear scan only (for now).** Search is brute-force dot product over all vectors. No sublinear indexing (IVF, HNSW). At >100k vectors, latency grows linearly. The two-stage architecture is a natural fit for adding partition-based coarse search, or for plugging polar-embed's training-free encoding into an existing ANN index.
 
-- **Matryoshka nesting penalty.** Nested codebooks are ~1.5% worse than independently optimized codebooks at each bit level. The trade-off is worth it for two-stage search but not free.
+- **Matryoshka nesting penalty.** Nested codebooks are ~1.2% worse than independently optimized codebooks at 4-bit, but up to ~10% worse at 2-bit. For two-stage search, the coarse pass only needs to identify the right neighborhood (not rank precisely), so the penalty is less impactful in practice.
 
-- **No GPU acceleration.** All operations are NumPy on CPU.
+- **CPU only (for now).** All operations are NumPy on CPU. The hot path (matrix multiply + top-k) maps trivially to GPU via CuPy or PyTorch tensors — contributions welcome.
 
 ## Calibration guide
 
