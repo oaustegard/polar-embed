@@ -1,7 +1,8 @@
 """
 SPECTER2 distribution analysis and recall benchmark for remex.
 
-Fetches real SPECTER2 embeddings (768-d) from the Semantic Scholar API,
+Fetches paper titles+abstracts from the Semantic Scholar API, encodes
+them with the SPECTER2 model (allenai/specter2_base, 768-d) locally,
 then analyzes whether the post-rotation coordinate distribution matches
 the N(0, 1/sqrt(d)) Gaussian assumption that Lloyd-Max relies on.
 
@@ -13,12 +14,13 @@ Key deliverable: where do real SPECTER2 partitions land on remex's
 sensitivity curve, and does it change between broad vs narrow fields?
 
 Usage:
-    python bench/specter2_eval.py              # full run (~30 min for API)
-    python bench/specter2_eval.py --cached     # skip API, use saved .npy files
+    python bench/specter2_eval.py              # full run (~30 min for API + encoding)
+    python bench/specter2_eval.py --cached     # skip API/encoding, use saved .npy files
     python bench/specter2_eval.py --plots      # also save distribution plots
 
-S2 API: GET https://api.semanticscholar.org/graph/v1/paper/search/bulk
-  ?query=...&fields=embedding.specter_v2  — no auth needed, 1 RPS limit.
+Requirements:
+    pip install transformers torch   # for SPECTER2 model
+    # S2 API for paper metadata: no auth needed, 1 RPS limit
 """
 
 import argparse
@@ -42,33 +44,46 @@ TARGET_N = 10_000
 
 
 # ---------------------------------------------------------------------------
-# Fetching SPECTER2 embeddings from Semantic Scholar
+# Fetching paper texts from Semantic Scholar + encoding with SPECTER2
 # ---------------------------------------------------------------------------
 
 
-def fetch_specter2_embeddings(query: str, target_n: int = TARGET_N) -> np.ndarray:
-    """Fetch SPECTER2 embeddings from the Semantic Scholar bulk search API.
-
-    Paginates using the `token` continuation field.  Respects 1 RPS rate limit.
-
-    Returns:
-        (n, 768) float32 array of SPECTER2 embeddings.
-    """
+def _s2_api_get(url: str) -> dict:
+    """Make a GET request to the S2 API with retries."""
     import urllib.request
-    import urllib.parse
     import urllib.error
 
-    embeddings = []
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url)
+            req.add_header("User-Agent", "remex-bench/0.1")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            wait = 2 ** (attempt + 1)
+            print(f"    Retry {attempt+1}/4 after error: {e} (wait {wait}s)")
+            time.sleep(wait)
+    raise RuntimeError(f"S2 API request failed after 4 retries: {url}")
+
+
+def fetch_paper_texts(query: str, target_n: int = TARGET_N) -> list:
+    """Fetch paper title+abstract texts from the Semantic Scholar bulk API.
+
+    Returns list of strings formatted as "title [SEP] abstract" for SPECTER2.
+    """
+    import urllib.parse
+
+    texts = []
     token = None
     page = 0
 
-    print(f"  Fetching SPECTER2 embeddings for query='{query}'...")
-    print(f"  Target: {target_n} vectors")
+    print(f"  Fetching paper texts for query='{query}'...")
+    print(f"  Target: {target_n} papers with abstracts")
 
-    while len(embeddings) < target_n:
+    while len(texts) < target_n:
         params = {
             "query": query,
-            "fields": "embedding.specter_v2",
+            "fields": "title,abstract",
         }
         if token is not None:
             params["token"] = token
@@ -76,39 +91,29 @@ def fetch_specter2_embeddings(query: str, target_n: int = TARGET_N) -> np.ndarra
         url = S2_BASE + "?" + urllib.parse.urlencode(params)
         page += 1
 
-        for attempt in range(4):
-            try:
-                req = urllib.request.Request(url)
-                req.add_header("User-Agent", "remex-bench/0.1")
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode())
-                break
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
-                wait = 2 ** (attempt + 1)
-                print(f"    Retry {attempt+1}/4 after error: {e} (wait {wait}s)")
-                time.sleep(wait)
-        else:
-            print(f"    Failed after 4 retries, stopping at {len(embeddings)} vectors")
+        try:
+            data = _s2_api_get(url)
+        except RuntimeError as e:
+            print(f"    {e}, stopping at {len(texts)} texts")
             break
 
         papers = data.get("data", [])
         if not papers:
-            print(f"    No more papers returned, got {len(embeddings)} total")
+            print(f"    No more papers returned, got {len(texts)} total")
             break
 
         for paper in papers:
-            emb = paper.get("embedding", {})
-            if emb is None:
-                continue
-            vec = emb.get("specter_v2")
-            if vec is not None and len(vec) == SPECTER2_DIM:
-                embeddings.append(vec)
-                if len(embeddings) >= target_n:
+            title = paper.get("title") or ""
+            abstract = paper.get("abstract") or ""
+            if title and abstract:
+                # SPECTER2 format: title [SEP] abstract
+                texts.append(f"{title} [SEP] {abstract}")
+                if len(texts) >= target_n:
                     break
 
         token = data.get("token")
-        n_so_far = len(embeddings)
-        print(f"    Page {page}: {len(papers)} papers, {n_so_far}/{target_n} embeddings collected")
+        n_so_far = len(texts)
+        print(f"    Page {page}: {len(papers)} papers, {n_so_far}/{target_n} with abstracts")
 
         if token is None:
             print(f"    No continuation token, stopping at {n_so_far}")
@@ -117,23 +122,110 @@ def fetch_specter2_embeddings(query: str, target_n: int = TARGET_N) -> np.ndarra
         # Rate limit: 1 RPS
         time.sleep(1.0)
 
-    result = np.array(embeddings[:target_n], dtype=np.float32)
-    print(f"  Collected {result.shape[0]} embeddings of dimension {result.shape[1]}")
+    print(f"  Collected {len(texts)} paper texts")
+    return texts[:target_n]
+
+
+def encode_with_specter2(
+    texts: list, batch_size: int = 32, checkpoint_path: str = None
+) -> np.ndarray:
+    """Encode texts with the SPECTER2 model (allenai/specter2_base).
+
+    Supports incremental checkpointing: saves progress every 256 texts
+    so encoding can be resumed if interrupted.
+
+    Returns (n, 768) float32 embeddings.
+    """
+    from transformers import AutoTokenizer, AutoModel
+    import torch
+
+    # Resume from checkpoint if available
+    start_idx = 0
+    all_embeddings = []
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        partial = np.load(checkpoint_path)
+        start_idx = partial.shape[0]
+        all_embeddings.append(partial)
+        print(f"  Resuming from checkpoint: {start_idx}/{len(texts)} already encoded")
+        if start_idx >= len(texts):
+            return partial[:len(texts)]
+
+    model_name = "allenai/specter2_base"
+    print(f"  Loading SPECTER2 model: {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model.eval()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    print(f"  Device: {device}, encoding {len(texts) - start_idx} remaining texts...")
+
+    checkpoint_interval = 256  # save every 256 texts
+    t0 = time.time()
+    for i in range(start_idx, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        inputs = tokenizer(
+            batch, padding=True, truncation=True, max_length=512,
+            return_tensors="pt"
+        ).to(device)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        # CLS token embedding
+        emb = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+        all_embeddings.append(emb)
+
+        done = i + len(batch)
+        if done % checkpoint_interval < batch_size or done >= len(texts):
+            elapsed = time.time() - t0
+            rate = (done - start_idx) / max(elapsed, 0.01)
+            remaining = (len(texts) - done) / max(rate, 0.01)
+            print(f"    {done}/{len(texts)} encoded ({elapsed:.0f}s, "
+                  f"~{remaining:.0f}s remaining)")
+            # Save checkpoint
+            if checkpoint_path:
+                concat = np.concatenate(all_embeddings, axis=0).astype(np.float32)
+                np.save(checkpoint_path, concat)
+
+    result = np.concatenate(all_embeddings, axis=0).astype(np.float32)
+    print(f"  Encoded {result.shape[0]} vectors of dimension {result.shape[1]} "
+          f"in {time.time()-t0:.1f}s")
     return result
 
 
-def load_or_fetch(query: str, label: str, use_cache: bool = True) -> np.ndarray:
-    """Load cached embeddings or fetch from API."""
+def load_or_fetch(
+    query: str, label: str, target_n: int = TARGET_N, use_cache: bool = True
+) -> np.ndarray:
+    """Load cached embeddings or fetch texts from S2 + encode with SPECTER2."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, f"{label}.npy")
+    texts_path = os.path.join(CACHE_DIR, f"{label}_texts.json")
+    checkpoint_path = os.path.join(CACHE_DIR, f"{label}_partial.npy")
 
     if use_cache and os.path.exists(cache_path):
-        print(f"  Loading cached embeddings from {cache_path}")
-        return np.load(cache_path)
+        emb = np.load(cache_path)
+        print(f"  Loading cached embeddings from {cache_path} ({emb.shape[0]} vectors)")
+        return emb[:target_n]
 
-    embeddings = fetch_specter2_embeddings(query)
+    # Fetch or load cached texts
+    if os.path.exists(texts_path):
+        print(f"  Loading cached texts from {texts_path}")
+        with open(texts_path) as f:
+            texts = json.load(f)
+    else:
+        texts = fetch_paper_texts(query, target_n)
+        if len(texts) == 0:
+            raise RuntimeError(f"No paper texts fetched for query '{query}'")
+        with open(texts_path, "w") as f:
+            json.dump(texts, f)
+        print(f"  Saved {len(texts)} texts to {texts_path}")
+
+    texts = texts[:target_n]
+    embeddings = encode_with_specter2(texts, checkpoint_path=checkpoint_path)
     np.save(cache_path, embeddings)
-    print(f"  Saved to {cache_path}")
+    # Clean up checkpoint
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    print(f"  Saved final embeddings to {cache_path}")
     return embeddings
 
 
@@ -442,23 +534,29 @@ def main():
                         help="Save distribution plots (requires matplotlib)")
     parser.add_argument("--skip-recall", action="store_true",
                         help="Skip recall benchmark (distribution analysis only)")
+    parser.add_argument("-n", "--num-vectors", type=int, default=TARGET_N,
+                        help=f"Number of vectors per partition (default: {TARGET_N})")
     args = parser.parse_args()
 
     d = SPECTER2_DIM
+    target_n = args.num_vectors
 
     # --- Fetch / load embeddings ---
     print("=" * 60)
     print("  SPECTER2 Distribution Analysis for remex")
+    print(f"  Target: {target_n} vectors per partition")
     print("=" * 60)
 
     corpus_broad = load_or_fetch(
         "natural language processing",
         "specter2_nlp_broad",
+        target_n=target_n,
         use_cache=args.cached,
     )
     corpus_narrow = load_or_fetch(
         "transformer attention mechanism",
         "specter2_transformer_narrow",
+        target_n=target_n,
         use_cache=args.cached,
     )
 
