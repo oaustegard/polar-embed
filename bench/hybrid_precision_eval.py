@@ -232,12 +232,25 @@ def hybrid_scores(
 ) -> tuple[np.ndarray, float]:
     """Score queries against a hybrid-precision index.
 
+    Uses a **single Matryoshka-nested Quantizer** at ``high_bits`` so the
+    codebooks across tiers are probability-consistent. Scoring the two
+    tiers with independently-fit Lloyd-Max codebooks at different bit
+    widths would produce score shifts (on SPECTER2, 2-bit means ~10%
+    smaller than exact, while 8-bit means match exactly) — merging such
+    scores without calibration pushes low-tier vectors below the full
+    high-tier regardless of relevance.
+
     Protocol:
-      1. Compute per-vector residual under ``low_bits`` TurboQuant.
-      2. Top ``k_pct`` of vectors by residual → quantize at ``high_bits``.
-      3. Remaining (1 - k_pct) → quantize at ``low_bits``.
-      4. ADC-score both tiers with the *same* Haar rotation (seed).
-      5. Concatenate scores in original corpus order.
+      1. Compute per-vector residual under ``low_bits`` to pick the tail.
+      2. Top ``k_pct`` of vectors by residual → score at ``high_bits``.
+      3. Remaining vectors → score at ``low_bits`` (same Quantizer, via
+         Matryoshka right-shift; same Haar rotation; centroids from the
+         same nested table).
+      4. Concatenate scores into corpus order.
+
+    Memory accounting: high tier stored at ``high_bits``, low tier
+    right-shifted to ``low_bits`` for bit-packed storage. Average
+    bits/vector = k * high_bits + (1 - k) * low_bits.
 
     Returns (scores: (n_queries, n), avg_bits_per_vector).
     """
@@ -245,7 +258,7 @@ def hybrid_scores(
     d = corpus.shape[1]
     n = corpus.shape[0]
 
-    # Tier selection by low-bit residual
+    # Tier selection — quick 2-bit reconstruction error picks the tail.
     rel_err_low, _ = residual_errors(corpus, low_bits, seed=seed)
     n_high = max(1, int(np.ceil(n * k_pct)))
     high_idx = np.argpartition(-rel_err_low, n_high)[:n_high]
@@ -253,17 +266,21 @@ def hybrid_scores(
     high_mask[high_idx] = True
     low_idx = np.where(~high_mask)[0]
 
-    q_high = Quantizer(d=d, bits=high_bits, seed=seed)
-    q_low = Quantizer(d=d, bits=low_bits, seed=seed)
-    comp_high = q_high.encode(corpus[high_idx])
-    comp_low = q_low.encode(corpus[low_idx])
+    # Single Quantizer at high_bits; Matryoshka handles low_bits via
+    # right-shift of the same indices with nested centroids.
+    q = Quantizer(d=d, bits=high_bits, seed=seed)
+    compressed = q.encode(corpus)
+    comp_high = compressed.subset(high_idx)
+    comp_low = compressed.subset(low_idx)
 
     all_scores = np.empty((queries.shape[0], n), dtype=np.float32)
     for qi, query in enumerate(queries):
-        # search_adc returns top-k; we need all scores for merge, so call the
-        # scoring helper directly via a full-corpus k.
-        idx_h, sc_h = q_high.search_adc(comp_high, query, k=len(high_idx))
-        idx_l, sc_l = q_low.search_adc(comp_low, query, k=len(low_idx))
+        idx_h, sc_h = q.search_adc(
+            comp_high, query, k=len(high_idx), precision=None
+        )
+        idx_l, sc_l = q.search_adc(
+            comp_low, query, k=len(low_idx), precision=low_bits
+        )
         scores_row = np.empty(n, dtype=np.float32)
         scores_row[high_idx[idx_h]] = sc_h
         scores_row[low_idx[idx_l]] = sc_l
