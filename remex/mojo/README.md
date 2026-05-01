@@ -103,24 +103,48 @@ provides those two ways:
 
 | Flag | Source of (R, codebook) | Bit-identical to a Python `Quantizer(seed=S)`? |
 |---|---|---|
-| `--seed S` | Computed in Mojo from S via xoshiro256++ + Householder QR + Lloyd-Max | **No.** Mojo uses xoshiro256++; Python uses NumPy's PCG64 + `default_rng`. The rotations are different but both are valid Haar samples. |
-| `--params P.bin` | Loaded from a file written by `remex.save_params(quantizer, P)` | **Yes.** Mojo's encoded `.pq` is byte-identical to Python's. |
+| `--seed S` *(default RNG: numpy)* | Computed in Mojo from S via PCG64 + SeedSequence + Ziggurat + Householder QR + Lloyd-Max | **Yes**, at 1–4 bits. **8-bit:** see caveat below. |
+| `--seed S --rng xoshiro` | Computed in Mojo from S via xoshiro256++ + Marsaglia + Householder QR + Lloyd-Max | **No.** Both Haar samples but from different Gaussian streams. Faster init, no Ziggurat tables. |
+| `--params P.bin` | Loaded from a file written by `remex.save_params(quantizer, P)` | **Yes**, at all bit widths. |
 
-`--params` is what the parity test (`tests/test_encode.mojo`) uses. Use
-it when you want a Mojo-encoded index that the Python library can search
-into and recover the same neighbors as if Python had encoded the corpus
-itself. Use `--seed` for a fully self-contained Mojo workflow.
+`--seed` (numpy mode, the default) gives a self-contained Mojo workflow
+with end-to-end byte parity vs Python: `polarquant encode X.npy --bits 4
+--seed 42 -o out.pq` produces the same bytes as Python's
+`save_pq(Quantizer(d, 4, seed=42).encode(X))`. This was the goal of
+issue #40 and uses the new `src/rng_numpy.mojo` module.
+
+`--seed --rng xoshiro` is the legacy fast path. Use it when you don't
+need Python parity — startup is slightly faster (no 25 KB of Ziggurat
+tables to populate).
+
+`--params` remains the canonical bridge for any case where you want
+guaranteed bit parity regardless of bit width or potential drift.
+
+### 8-bit byte-parity caveat
+
+At `--bits 8`, the Lloyd-Max codebook uses 256 levels and runs 300
+iterations of refinement. Mojo's `std.math.erf` differs from libm's
+`math.erf` (used by `scipy.stats.norm.cdf`) by ~1e-8 per call. Across
+300 iterations × 256 levels these accumulate, shifting a handful of
+codebook boundaries by ~1e-3. Net effect: ~0.1–0.2% of indices end up
+1 level off. The encoded `.pq` is ~99.8% byte-identical but not
+strictly so. For 1/2/3/4 bit, the codebook has fewer levels and far
+more margin, so byte parity holds exactly.
+
+If you need byte parity at 8-bit, use `--params`. (This is a Mojo
+stdlib precision limitation, not a remex algorithm issue.)
 
 ## Tests
 
 ```bash
 cd remex/mojo
 mojo run -I . tests/test_rng.mojo
+mojo run -I . tests/test_rng_numpy.mojo   # NumPy-bit-identical RNG (issue #40)
 mojo run -I . tests/test_rotation.mojo
 mojo run -I . tests/test_codebook.mojo
 mojo run -I . tests/test_packing.mojo
 
-# Encode parity (requires Python remex installed and fixtures generated):
+# Encode parity via --params (requires Python remex installed and fixtures generated):
 python -c "
 import numpy as np
 from remex import Quantizer, save_pq, save_params
@@ -177,6 +201,18 @@ np.save('/tmp/_pv_meta.npy',
         np.array([[n, d, bits, target_bits]], dtype=np.float32))
 "
 mojo run -I . tests/test_packed_vectors.mojo
+
+# Encode parity via --seed (NumPy-compatible RNG path, issue #40):
+python -c "
+import numpy as np
+from remex import Quantizer, save_pq
+np.random.seed(0)
+X = np.random.randn(50, 16).astype(np.float32)
+np.save('/tmp/_seed_parity_X.npy', X)
+q = Quantizer(d=16, bits=4, seed=42)
+save_pq('/tmp/_seed_parity_ref.pq', q.encode(X))
+"
+mojo run -I . tests/test_encode_seed.mojo
 
 # search_twostage parity (also requires Python remex installed):
 python -c "
@@ -296,8 +332,9 @@ already works.
 
 - **Encode hot loop is SIMD-vectorized + NB=8 row-blocked.** The per-row
   rotation matvec and the squared-norm reduction in `encode_batch` use a
-  `simd_width_of[DType.float32]()`-wide FMA + horizontal reduce. On top
-  of that, `encode_batch` processes 8 rows of X at a time through
+  `simd_width_of[DType.float32]()`-wide FMA + horizontal reduce — see
+  `_dot_f32`, `_dot_block_8`, and `_sumsq_f64` in `src/quantizer.mojo`.
+  On top of that, `encode_batch` processes 8 rows of X at a time through
   `_dot_block_8`, which fuses 8 dot products against the same R[k, :]
   into eight SIMD accumulators sharing one R-load per j-step. R memory
   traffic drops 8× — the unblocked path reloaded the full ~d²·4 bytes
@@ -314,10 +351,11 @@ already works.
   tests, and bench drivers, but `src/gpu/encode.mojo` and
   `src/gpu/adc.mojo` raise until the MAX implementation lands — see
   the `## GPU / MAX path` section above and issue #42.
-- **Seed parity** with NumPy's `default_rng` is not bit-identical (see
-  the table above). Implementing PCG64 + SeedSequence + Ziggurat in
-  Mojo to match NumPy exactly is a separate, substantial effort. The
-  `--params` file path is the practical bridge.
+- **Seed parity** with NumPy's `default_rng` is now bit-identical at
+  1–4 bits via `src/rng_numpy.mojo` (PCG64 + SeedSequence + Ziggurat,
+  issue #40). 8-bit byte parity is blocked by Mojo `std.math.erf`
+  precision drift in the 256-level Lloyd-Max iteration — see the 8-bit
+  caveat above; use `--params` for guaranteed parity at 8-bit.
 - **UnsafePointer field aliasing.** Several spots copy struct-owned
   buffers into a fresh local allocation before passing the pointer to
   another function. Direct `struct.field[i]` reads through an

@@ -128,17 +128,24 @@ fn _dot_block_8(r_row: UnsafePointer[Float32, MutExternalOrigin],
     dst[7] = s7
 
 
-fn _sumsq_f32(a: UnsafePointer[Float32, MutExternalOrigin], n: Int) -> Float32:
-    """SIMD-vectorized sum of squares: sum_i a[i] * a[i]."""
-    var acc = SIMD[DType.float32, _W](0)
+fn _sumsq_f64(a: UnsafePointer[Float32, MutExternalOrigin], n: Int) -> Float64:
+    """Sum of squares with float64 accumulator (returned as float64).
+
+    Float64 accumulation eliminates BLAS-vs-SIMD reduction-order ULP
+    divergence — required for byte-identical norm output vs Python.
+    The caller computes sqrt in float64 and casts to float32, matching
+    the Python pipeline `np.sqrt(np.sum(X.astype(f64)**2)).astype(f32)`.
+    """
+    var acc = SIMD[DType.float64, _W](0)
     var i = 0
     while i + _W <= n:
-        var av = a.load[width=_W](i)
-        acc = av.fma(av, acc)
+        var av32 = a.load[width=_W](i)
+        var av64 = av32.cast[DType.float64]()
+        acc = av64.fma(av64, acc)
         i += _W
-    var s: Float32 = acc.reduce_add()
+    var s: Float64 = acc.reduce_add()
     while i < n:
-        s += a[i] * a[i]
+        s += Float64(a[i]) * Float64(a[i])
         i += 1
     return s
 
@@ -231,9 +238,12 @@ def encode_batch(q: Quantizer,
 
         # 1. Norms + invs for the block. Reads X[ii:ii+nb, :] sequentially —
         # warms the panel into L1 ahead of the matvec sweep below.
+        # Norm computed in float64 then cast to float32, matching Python's
+        # `np.sqrt(np.sum(X.astype(f64)**2)).astype(f32)` order — needed for
+        # byte-identical norms vs Python (issue #40).
         for io in range(nb):
             var i = ii + io
-            var nm = sqrt(_sumsq_f32(X + i * d, d))
+            var nm = Float32(sqrt(_sumsq_f64(X + i * d, d)))
             norms_out[i] = nm
             inv_block[io] = Float32(1.0) / nm if nm > Float32(1e-8) else Float32(1.0 / 1e-8)
 
