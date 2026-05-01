@@ -16,21 +16,23 @@ remex/mojo/
 │   ├── rng.mojo             # xoshiro256++ + Marsaglia polar normal
 │   ├── matrix.mojo          # Owning Float32 / Float64 matrices
 │   ├── rotation.mojo        # Householder QR → Haar orthogonal matrix
-│   ├── codebook.mojo        # Lloyd-Max iteration on N(0, 1/d)
+│   ├── codebook.mojo        # Lloyd-Max iteration on N(0, 1/d) + Matryoshka nested tables
 │   ├── packing.mojo         # 1/2/3/4/8-bit pack and unpack
 │   ├── npy.mojo             # .npy reader (float32, 2D, C-contiguous)
 │   ├── pq_format.mojo       # .pq binary format read/write
 │   ├── params_format.mojo   # .params dump (R + boundaries + centroids)
-│   └── quantizer.mojo       # Quantizer struct: encode + ADC search
+│   └── quantizer.mojo       # Quantizer struct: encode + ADC search + two-stage search
 ├── tests/
 │   ├── test_rng.mojo
 │   ├── test_rotation.mojo
 │   ├── test_codebook.mojo
 │   ├── test_packing.mojo
-│   └── test_encode.mojo     # bit-identical encode parity vs Python
+│   ├── test_encode.mojo            # bit-identical encode parity vs Python
+│   └── test_search_twostage.mojo   # top-k parity for search_twostage vs Python
 └── bench/
     ├── bench_encode.mojo
     ├── bench_search.mojo
+    ├── bench_twostage.mojo
     └── compare.py           # Mojo vs NumPy comparison driver
 ```
 
@@ -50,6 +52,7 @@ cd remex/mojo
 mojo build -I . polarquant.mojo            -o polarquant
 mojo build -I . bench/bench_encode.mojo    -o bench/bench_encode
 mojo build -I . bench/bench_search.mojo    -o bench/bench_search
+mojo build -I . bench/bench_twostage.mojo  -o bench/bench_twostage
 ```
 
 ## CLI usage
@@ -60,6 +63,11 @@ mojo build -I . bench/bench_search.mojo    -o bench/bench_search
 
 # Search a single (1, d) query against a .pq, top-k
 ./polarquant search corpus.pq query.npy --k 10 --seed 42 --top 10
+
+# Memory-efficient two-stage retrieval: coarse ADC scan at reduced
+# precision, full-precision rerank on the top `--candidates` rows.
+./polarquant search corpus.pq query.npy --k 10 --seed 42 \
+    --twostage --candidates 500 --coarse-precision 2
 ```
 
 The same `corpus.pq` round-trips through the Python library:
@@ -106,6 +114,42 @@ save_params('/tmp/_parity.params', q)
 save_pq('/tmp/_parity_ref.pq', q.encode(X))
 "
 mojo run -I . tests/test_encode.mojo
+
+# search_twostage parity (also requires Python remex installed):
+python -c "
+import numpy as np
+from remex import Quantizer, save_pq, save_params
+
+np.random.seed(0)
+n, d, bits = 200, 16, 4
+n_q, k, candidates, coarse_precision = 8, 5, 50, 2
+
+X = np.random.randn(n, d).astype(np.float32)
+Q = np.random.randn(n_q, d).astype(np.float32)
+
+q = Quantizer(d=d, bits=bits, seed=42)
+save_params('/tmp/_twostage.params', q)
+cv = q.encode(X)
+save_pq('/tmp/_twostage.pq', cv)
+
+np.save('/tmp/_twostage_X.npy', X)
+np.save('/tmp/_twostage_Q.npy', Q)
+
+expected_idx = np.zeros((n_q, k), dtype=np.float32)
+expected_scores = np.zeros((n_q, k), dtype=np.float32)
+for i in range(n_q):
+    ti, ts = q.search_twostage(
+        cv, Q[i], k=k, candidates=candidates,
+        coarse_precision=coarse_precision)
+    expected_idx[i] = ti.astype(np.float32)
+    expected_scores[i] = ts
+
+meta = np.array([[k, candidates, coarse_precision, n_q]], dtype=np.float32)
+np.save('/tmp/_twostage_meta.npy', meta)
+np.save('/tmp/_twostage_expected_idx.npy', expected_idx)
+np.save('/tmp/_twostage_expected_scores.npy', expected_scores)
+"
+mojo run -I . tests/test_search_twostage.mojo
 ```
 
 ## Benchmarks
@@ -127,7 +171,11 @@ See `bench/RESULTS.md` (in this PR) for current numbers.
   µs/vec to 21 µs/vec at d=384 (8.6x speedup), within 1.3x of NumPy's
   BLAS `X @ R.T`. Closing the remaining gap would mean tiling /
   blocking the matvec or batching multiple rows per call.
-- **No Matryoshka / no `search_twostage`.** Out of scope for issue #5.
+- **`search_twostage` is naive.** The coarse stage is a straightforward
+  per-row ADC table lookup (no SIMD on the lookup gather), and the
+  candidate selection is O(n*candidates). Mirrors the structure of
+  `adc_search` in this port. Tighter inner-loop kernels — especially
+  for the coarse-stage reduction at low precision — are a follow-up.
 - **No GPU.** The `coding-mojo` skill notes Claude.ai containers are
   CPU-only; GPU work needs to be tested on a different host.
 - **Seed parity** with NumPy's `default_rng` is not bit-identical (see

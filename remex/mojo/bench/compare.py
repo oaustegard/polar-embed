@@ -1,15 +1,17 @@
-"""Mojo vs NumPy benchmark for remex encode + ADC search.
+"""Mojo vs NumPy benchmark for remex encode + ADC search + two-stage search.
 
 Generates a synthetic standard-normal corpus, runs the same workload
-through (a) the Python `remex.Quantizer` and (b) the Mojo binary built
+through (a) the Python `remex.Quantizer` and (b) the Mojo binaries built
 from `polarquant.mojo`. Prints a comparison table.
 
 Usage:
     python bench/compare.py [--n 10000] [--d 384] [--bits 4]
                             [--queries 100] [--k 10]
+                            [--candidates 500] [--coarse-precision K]
 
-The Mojo binaries are expected at `bench/bench_encode` and
-`bench/bench_search` (build them with `mojo build`).
+The Mojo binaries are expected at `bench/bench_encode`,
+`bench/bench_search`, and `bench/bench_twostage` (build them with
+`mojo build`).
 """
 
 import argparse
@@ -60,8 +62,17 @@ def main() -> int:
     ap.add_argument("--bits", type=int, default=4)
     ap.add_argument("--queries", type=int, default=100)
     ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--candidates", type=int, default=500)
+    ap.add_argument("--coarse-precision", type=int, default=None,
+                    help="Coarse-stage precision for two-stage search "
+                         "(default: max(1, bits - 2))")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    coarse_precision = (
+        args.coarse_precision
+        if args.coarse_precision is not None
+        else max(1, args.bits - 2)
+    )
 
     sys.path.insert(0, str(REPO_ROOT))
     from remex import Quantizer
@@ -85,6 +96,19 @@ def main() -> int:
         pq.search_adc(cv, q, k=args.k)
     py_search_ms_per_q = (time.perf_counter() - t0) / args.queries * 1e3
 
+    # --- Python two-stage search ---
+    pq.search_twostage(
+        cv, Qs[0], k=args.k,
+        candidates=args.candidates, coarse_precision=coarse_precision,
+    )  # warmup
+    t0 = time.perf_counter()
+    for q in Qs:
+        pq.search_twostage(
+            cv, q, k=args.k,
+            candidates=args.candidates, coarse_precision=coarse_precision,
+        )
+    py_twostage_ms_per_q = (time.perf_counter() - t0) / args.queries * 1e3
+
     # --- Mojo encode ---
     out = _run_mojo("bench_encode", [
         "--n", str(args.n), "--d", str(args.d),
@@ -100,19 +124,35 @@ def main() -> int:
     ])
     mojo_search_ms_per_q = _parse_ms_per_query(out)
 
+    # --- Mojo two-stage search ---
+    out = _run_mojo("bench_twostage", [
+        "--n", str(args.n), "--d", str(args.d),
+        "--bits", str(args.bits), "--queries", str(args.queries),
+        "--k", str(args.k), "--seed", str(args.seed),
+        "--candidates", str(args.candidates),
+        "--coarse-precision", str(coarse_precision),
+    ])
+    mojo_twostage_ms_per_q = _parse_ms_per_query(out)
+
     print()
-    print(f"=== n={args.n}, d={args.d}, bits={args.bits} ===")
-    print(f"{'Stage':<12} {'NumPy':>14} {'Mojo':>14} {'Speedup':>10}")
-    print("-" * 54)
+    print(f"=== n={args.n}, d={args.d}, bits={args.bits}, "
+          f"candidates={args.candidates}, coarse_precision={coarse_precision} ===")
+    print(f"{'Stage':<14} {'NumPy':>14} {'Mojo':>14} {'Speedup':>10}")
+    print("-" * 56)
     print(
-        f"{'encode (us)':<12} "
+        f"{'encode (us)':<14} "
         f"{py_encode_us_per_vec:>14.2f} {mojo_encode_us_per_vec:>14.2f} "
         f"{py_encode_us_per_vec/mojo_encode_us_per_vec:>9.2f}x"
     )
     print(
-        f"{'search (ms)':<12} "
+        f"{'search (ms)':<14} "
         f"{py_search_ms_per_q:>14.3f} {mojo_search_ms_per_q:>14.3f} "
         f"{py_search_ms_per_q/mojo_search_ms_per_q:>9.2f}x"
+    )
+    print(
+        f"{'twostage (ms)':<14} "
+        f"{py_twostage_ms_per_q:>14.3f} {mojo_twostage_ms_per_q:>14.3f} "
+        f"{py_twostage_ms_per_q/mojo_twostage_ms_per_q:>9.2f}x"
     )
     print()
     print(

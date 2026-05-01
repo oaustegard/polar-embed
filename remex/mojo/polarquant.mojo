@@ -15,12 +15,12 @@ Outputs `index.pq`, the binary container readable by `remex.load_pq()`.
 
 from std.sys import argv
 from std.memory import alloc, UnsafePointer
-from src.codebook import Codebook, lloyd_max_codebook
+from src.codebook import Codebook, NestedCodebook, lloyd_max_codebook, nested_codebooks_from
 from src.matrix import Matrix
 from src.npy import load_npy_2d_f32
 from src.params_format import load_params
 from src.pq_format import save_pq, load_pq
-from src.quantizer import Quantizer, encode_batch, adc_search
+from src.quantizer import Quantizer, encode_batch, adc_search, search_twostage
 from src.packing import pack, packed_nbytes
 from src.rotation import haar_rotation
 
@@ -54,6 +54,7 @@ def _print_usage():
     print("usage:")
     print("  polarquant encode <input.npy> --bits N (--seed S | --params P) -o <out.pq>")
     print("  polarquant search <index.pq> <query.npy> --k K (--seed S | --params P) [--top T]")
+    print("                   [--twostage --candidates N --coarse-precision K]")
 
 
 def cmd_encode(args: List[String]) raises:
@@ -146,6 +147,21 @@ def cmd_search(args: List[String]) raises:
     if top_idx >= 0:
         print_top = Int(_arg_str(args, top_idx + 1))
 
+    # Two-stage mode flags
+    var twostage_idx = _arg_idx(args, String("--twostage"))
+    var use_twostage = twostage_idx >= 0
+    var candidates = 0
+    var coarse_precision = 0
+    if use_twostage:
+        var cand_idx = _arg_idx(args, String("--candidates"))
+        if cand_idx < 0:
+            raise Error("search --twostage: --candidates N required")
+        candidates = Int(_arg_str(args, cand_idx + 1))
+        var cp_idx = _arg_idx(args, String("--coarse-precision"))
+        if cp_idx < 0:
+            raise Error("search --twostage: --coarse-precision K required")
+        coarse_precision = Int(_arg_str(args, cp_idx + 1))
+
     var pq = load_pq(index_path)
     var Q = load_npy_2d_f32(query_path)
     if Q.rows != 1:
@@ -171,7 +187,15 @@ def cmd_search(args: List[String]) raises:
 
     var top_idx_buf = alloc[Int](k)
     var top_scores = alloc[Float32](k)
-    adc_search(q_quant, indices, norms_local, pq.n, qbuf, k, top_idx_buf, top_scores)
+    if use_twostage:
+        # Build nested centroid tables from the loaded full-precision codebook.
+        # Reaching into q_quant.cb is fine — Quantizer is owned locally here.
+        var nested = nested_codebooks_from(q_quant.cb, pq.d)
+        search_twostage(q_quant, nested, indices, norms_local, pq.n,
+                        qbuf, k, candidates, coarse_precision,
+                        top_idx_buf, top_scores)
+    else:
+        adc_search(q_quant, indices, norms_local, pq.n, qbuf, k, top_idx_buf, top_scores)
 
     print("top", print_top, "results:")
     var to_print = print_top if print_top <= k else k
