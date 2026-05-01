@@ -16,6 +16,7 @@ from src.packing import pack, packed_nbytes
 
 
 alias _W = simd_width_of[DType.float32]()
+alias _NB = 8  # encode_batch row-block size; see _dot_block_8 below.
 
 
 fn _dot_f32(a: UnsafePointer[Float32, MutExternalOrigin],
@@ -41,6 +42,90 @@ fn _dot_f32(a: UnsafePointer[Float32, MutExternalOrigin],
         s += a[i] * b[i]
         i += 1
     return s
+
+
+fn _dot_block_8(r_row: UnsafePointer[Float32, MutExternalOrigin],
+                x_panel: UnsafePointer[Float32, MutExternalOrigin],
+                n: Int,
+                dst: UnsafePointer[Float32, MutExternalOrigin]):
+    """Eight dot products against the same `r_row`, fused over a single j sweep.
+
+    For io in [0, 8), computes `dst[io] = sum_j r_row[j] * x_panel[io*n + j]`.
+    `x_panel` is a contiguous 8-row panel (rows ii..ii+7 of X when X is
+    row-major, so callers can pass `X + ii*d` directly — no packing).
+
+    The fused kernel issues one `_W`-wide load of r_row per j-step and
+    eight FMAs into eight SIMD accumulators. Compared to eight separate
+    `_dot_f32` calls this drops R load count by 8× and keeps R[k, :] in
+    registers across all eight rows, which is the whole point of NB-row
+    blocking — `R` is `~d²·4` bytes and doesn't fit in L2 at d=384, so
+    the unblocked path reloads R from L3/memory once per row.
+
+    Per-row reduction order is identical to `_dot_f32`: one `_W`-wide
+    SIMD-FMA accumulator + horizontal reduce + scalar tail. Multiplication
+    is fp-commutative, so `(X*R)+acc` matches `_dot_f32`'s `(R*X)+acc`
+    bit-exactly. That's how `tests/test_encode.mojo` stays byte-identical.
+    """
+    var a0 = SIMD[DType.float32, _W](0)
+    var a1 = SIMD[DType.float32, _W](0)
+    var a2 = SIMD[DType.float32, _W](0)
+    var a3 = SIMD[DType.float32, _W](0)
+    var a4 = SIMD[DType.float32, _W](0)
+    var a5 = SIMD[DType.float32, _W](0)
+    var a6 = SIMD[DType.float32, _W](0)
+    var a7 = SIMD[DType.float32, _W](0)
+
+    var x0 = x_panel
+    var x1 = x_panel + n
+    var x2 = x_panel + 2 * n
+    var x3 = x_panel + 3 * n
+    var x4 = x_panel + 4 * n
+    var x5 = x_panel + 5 * n
+    var x6 = x_panel + 6 * n
+    var x7 = x_panel + 7 * n
+
+    var j = 0
+    while j + _W <= n:
+        var rv = r_row.load[width=_W](j)
+        a0 = x0.load[width=_W](j).fma(rv, a0)
+        a1 = x1.load[width=_W](j).fma(rv, a1)
+        a2 = x2.load[width=_W](j).fma(rv, a2)
+        a3 = x3.load[width=_W](j).fma(rv, a3)
+        a4 = x4.load[width=_W](j).fma(rv, a4)
+        a5 = x5.load[width=_W](j).fma(rv, a5)
+        a6 = x6.load[width=_W](j).fma(rv, a6)
+        a7 = x7.load[width=_W](j).fma(rv, a7)
+        j += _W
+
+    var s0: Float32 = a0.reduce_add()
+    var s1: Float32 = a1.reduce_add()
+    var s2: Float32 = a2.reduce_add()
+    var s3: Float32 = a3.reduce_add()
+    var s4: Float32 = a4.reduce_add()
+    var s5: Float32 = a5.reduce_add()
+    var s6: Float32 = a6.reduce_add()
+    var s7: Float32 = a7.reduce_add()
+
+    while j < n:
+        var rv = r_row[j]
+        s0 += rv * x0[j]
+        s1 += rv * x1[j]
+        s2 += rv * x2[j]
+        s3 += rv * x3[j]
+        s4 += rv * x4[j]
+        s5 += rv * x5[j]
+        s6 += rv * x6[j]
+        s7 += rv * x7[j]
+        j += 1
+
+    dst[0] = s0
+    dst[1] = s1
+    dst[2] = s2
+    dst[3] = s3
+    dst[4] = s4
+    dst[5] = s5
+    dst[6] = s6
+    dst[7] = s7
 
 
 fn _sumsq_f32(a: UnsafePointer[Float32, MutExternalOrigin], n: Int) -> Float32:
@@ -104,28 +189,69 @@ def encode_batch(q: Quantizer,
                  mut norms_out: UnsafePointer[Float32, MutExternalOrigin]) raises:
     """Encode `n` rows of (n, d) float32 X into uint8 indices_out (n, d) and norms_out (n,).
 
-    Hot path: per row, compute norm, normalize, rotate, searchsorted into boundaries.
-    The rotated coordinates live in a stack/heap buffer per row — never
-    materialized as an (n, d) intermediate.
+    Schedule: NB=8 row blocking around the rotation matvec. For each block of
+    8 rows we sweep k in [0, d) and call `_dot_block_8`, which fuses 8 dot
+    products against the same R[k, :]. R[k, :] is loaded once per k and
+    reused across 8 X-rows, cutting R memory traffic by 8× — the unblocked
+    path reloads the full ~d²·4 bytes of R per row, which at d=384 doesn't
+    fit in L2 and was the remaining gap to NumPy's BLAS after PR #37.
+
+    The rotated coordinates live in an (NB, d) scratch buffer per block —
+    never an (n, d) intermediate. Tail rows (n % 8) fall through the
+    per-row `_dot_f32` path used pre-blocking, so partial-block correctness
+    matches the original byte-for-byte.
     """
     var d = q.d
     var n_b = q.cb.n_levels - 1
-    var rotated = alloc[Float32](d)
-    for i in range(n):
-        var base = i * d
-        var nm = sqrt(_sumsq_f32(X + base, d))
-        norms_out[i] = nm
-        var inv = Float32(1.0) / nm if nm > Float32(1e-8) else Float32(1.0 / 1e-8)
+    var rot_block = alloc[Float32](_NB * d)
+    var inv_block = alloc[Float32](_NB)
+    var dot_out = alloc[Float32](_NB)
 
-        # Rotate: rotated[k] = (sum_j R[k, j] * X[i, j]) / nm.
-        # Each row of R and X[i, :] is contiguous — SIMD dot per output coord.
-        for k in range(d):
-            rotated[k] = _dot_f32(q.R.data + k * d, X + base, d) * inv
+    var ii = 0
+    while ii < n:
+        var nb = _NB if ii + _NB <= n else n - ii
 
-        # Searchsorted per coordinate
-        for k in range(d):
-            indices_out[base + k] = UInt8(_searchsorted(q.cb.boundaries, n_b, rotated[k]))
-    rotated.free()
+        # 1. Norms + invs for the block. Reads X[ii:ii+nb, :] sequentially —
+        # warms the panel into L1 ahead of the matvec sweep below.
+        for io in range(nb):
+            var i = ii + io
+            var nm = sqrt(_sumsq_f32(X + i * d, d))
+            norms_out[i] = nm
+            inv_block[io] = Float32(1.0) / nm if nm > Float32(1e-8) else Float32(1.0 / 1e-8)
+
+        # 2. Rotation matvec. Full-block fast path uses the fused 8-way kernel;
+        # the partial-block tail uses per-row _dot_f32 (same as pre-blocking).
+        if nb == _NB:
+            var x_panel = X + ii * d
+            for k in range(d):
+                _dot_block_8(q.R.data + k * d, x_panel, d, dot_out)
+                rot_block[0 * d + k] = dot_out[0] * inv_block[0]
+                rot_block[1 * d + k] = dot_out[1] * inv_block[1]
+                rot_block[2 * d + k] = dot_out[2] * inv_block[2]
+                rot_block[3 * d + k] = dot_out[3] * inv_block[3]
+                rot_block[4 * d + k] = dot_out[4] * inv_block[4]
+                rot_block[5 * d + k] = dot_out[5] * inv_block[5]
+                rot_block[6 * d + k] = dot_out[6] * inv_block[6]
+                rot_block[7 * d + k] = dot_out[7] * inv_block[7]
+        else:
+            for k in range(d):
+                var r_row = q.R.data + k * d
+                for io in range(nb):
+                    var s = _dot_f32(r_row, X + (ii + io) * d, d)
+                    rot_block[io * d + k] = s * inv_block[io]
+
+        # 3. Searchsorted + write indices for the block.
+        for io in range(nb):
+            var base = (ii + io) * d
+            var rb = rot_block + io * d
+            for k in range(d):
+                indices_out[base + k] = UInt8(_searchsorted(q.cb.boundaries, n_b, rb[k]))
+
+        ii += nb
+
+    rot_block.free()
+    inv_block.free()
+    dot_out.free()
 
 
 def adc_search(q: Quantizer,

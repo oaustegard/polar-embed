@@ -12,3 +12,4 @@ bench/plots/
 remex/mojo/polarquant
 remex/mojo/bench/bench_encode
 remex/mojo/bench/bench_search
+remex/mojo/bench/bench_twostage

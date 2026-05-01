@@ -294,14 +294,17 @@ already works.
 
 ## Notes / known gaps
 
-- **Encode hot loop is SIMD-vectorized.** The per-row rotation matvec
-  and the squared-norm reduction in `encode_batch` (and the q_rot
-  matvec in `adc_search`) use a `simd_width_of[DType.float32]()`-wide
-  FMA + horizontal reduce — see `_dot_f32` and `_sumsq_f32` in
-  `src/quantizer.mojo`. On AVX-512 this brings Mojo encode from 179
-  µs/vec to 21 µs/vec at d=384 (8.6x speedup), within 1.3x of NumPy's
-  BLAS `X @ R.T`. Closing the remaining gap would mean tiling /
-  blocking the matvec or batching multiple rows per call.
+- **Encode hot loop is SIMD-vectorized + NB=8 row-blocked.** The per-row
+  rotation matvec and the squared-norm reduction in `encode_batch` use a
+  `simd_width_of[DType.float32]()`-wide FMA + horizontal reduce. On top
+  of that, `encode_batch` processes 8 rows of X at a time through
+  `_dot_block_8`, which fuses 8 dot products against the same R[k, :]
+  into eight SIMD accumulators sharing one R-load per j-step. R memory
+  traffic drops 8× — the unblocked path reloaded the full ~d²·4 bytes
+  of R per row, which doesn't fit in L2 at d=384. The combined effect
+  brings Mojo encode from 179 µs/vec (pre-SIMD) → 21 µs/vec (PR #37)
+  → 12 µs/vec (this) at d=384, **1.26× faster than NumPy's BLAS
+  `X @ R.T`** on AVX-512 (issue #41).
 - **`search_twostage` is naive.** The coarse stage is a straightforward
   per-row ADC table lookup (no SIMD on the lookup gather), and the
   candidate selection is O(n*candidates). Mirrors the structure of
