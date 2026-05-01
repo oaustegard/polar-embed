@@ -23,6 +23,9 @@ from src.pq_format import save_pq, load_pq
 from src.quantizer import Quantizer, encode_batch, adc_search, search_twostage, decode_batch
 from src.packing import pack, packed_nbytes
 from src.rotation import haar_rotation
+from src.gpu.device import is_gpu_available
+from src.gpu.encode import gpu_encode_batch
+from src.gpu.adc import gpu_adc_search
 
 
 def _arg_str(args: List[String], idx: Int) raises -> String:
@@ -52,10 +55,32 @@ def _build_quantizer(d: Int, bits: Int, seed: UInt64,
 
 def _print_usage():
     print("usage:")
-    print("  polarquant encode <input.npy> --bits N (--seed S | --params P) -o <out.pq>")
-    print("  polarquant search <index.pq> <query.npy> --k K (--seed S | --params P) [--top T]")
+    print("  polarquant encode <input.npy> --bits N (--seed S | --params P) [--device cpu|gpu] -o <out.pq>")
+    print("  polarquant search <index.pq> <query.npy> --k K (--seed S | --params P) [--device cpu|gpu] [--top T]")
     print("                   [--twostage --candidates N --coarse-precision K]")
     print("  polarquant decode <index.pq> (--seed S | --params P) [--precision P] -o <out.npy>")
+
+
+def _parse_device(args: List[String]) raises -> String:
+    """Parse --device flag. Returns 'cpu' (default) or 'gpu'.
+
+    Errors if --device is given an unknown value, or if 'gpu' is requested
+    but no GPU is available (the GPU kernels are stubbed pending issue #42,
+    so `is_gpu_available()` returns False until they land).
+    """
+    var idx = _arg_idx(args, String("--device"))
+    if idx < 0:
+        return String("cpu")
+    var dev = _arg_str(args, idx + 1)
+    if dev != String("cpu") and dev != String("gpu"):
+        raise Error(String("--device must be 'cpu' or 'gpu', got: ") + dev)
+    if dev == String("gpu") and not is_gpu_available():
+        raise Error(
+            "--device gpu requested but no GPU is available. "
+            "GPU kernels are not yet implemented (see issue #42). "
+            "Drop the flag (or pass --device cpu) to run on CPU."
+        )
+    return dev
 
 
 def cmd_encode(args: List[String]) raises:
@@ -86,7 +111,9 @@ def cmd_encode(args: List[String]) raises:
         raise Error("encode: -o <out.pq> required")
     var out_path = _arg_str(args, out_idx + 1)
 
-    print("encode:", input_path, "→", out_path, "(bits =", bits, ")")
+    var device = _parse_device(args)
+
+    print("encode:", input_path, "→", out_path, "(bits =", bits, ", device =", device, ")")
     var X = load_npy_2d_f32(input_path)
     var n = X.rows
     var d = X.cols
@@ -103,7 +130,10 @@ def cmd_encode(args: List[String]) raises:
 
     var indices = alloc[UInt8](n * d)
     var norms = alloc[Float32](n)
-    encode_batch(q, X_buf, n, indices, norms)
+    if device == String("gpu"):
+        gpu_encode_batch(q, X_buf, n, indices, norms)
+    else:
+        encode_batch(q, X_buf, n, indices, norms)
     X_buf.free()
 
     var nb = packed_nbytes(n * d, bits)
@@ -148,9 +178,16 @@ def cmd_search(args: List[String]) raises:
     if top_idx >= 0:
         print_top = Int(_arg_str(args, top_idx + 1))
 
+    var device = _parse_device(args)
+
     # Two-stage mode flags
     var twostage_idx = _arg_idx(args, String("--twostage"))
     var use_twostage = twostage_idx >= 0
+    if use_twostage and device == String("gpu"):
+        raise Error(
+            "search --twostage --device gpu: not supported. "
+            "Issue #42 covers adc_search only; two-stage GPU is a follow-up."
+        )
     var candidates = 0
     var coarse_precision = 0
     if use_twostage:
@@ -195,6 +232,8 @@ def cmd_search(args: List[String]) raises:
         search_twostage(q_quant, nested, indices, norms_local, pq.n,
                         qbuf, k, candidates, coarse_precision,
                         top_idx_buf, top_scores)
+    elif device == String("gpu"):
+        gpu_adc_search(q_quant, indices, norms_local, pq.n, qbuf, k, top_idx_buf, top_scores)
     else:
         adc_search(q_quant, indices, norms_local, pq.n, qbuf, k, top_idx_buf, top_scores)
 

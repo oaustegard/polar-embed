@@ -24,7 +24,11 @@ remex/mojo/
 │   ├── npy.mojo             # .npy reader/writer (float32, 2D, C-contiguous)
 │   ├── pq_format.mojo       # .pq binary format read/write
 │   ├── params_format.mojo   # .params dump (R + boundaries + centroids)
-│   └── quantizer.mojo       # Quantizer struct: encode + ADC search + two-stage + decode
+│   ├── quantizer.mojo       # Quantizer struct: encode + ADC search + two-stage + decode
+│   └── gpu/                 # GPU/MAX kernels — scaffolding, see issue #42
+│       ├── device.mojo      # is_gpu_available() probe
+│       ├── encode.mojo      # gpu_encode_batch (stub)
+│       └── adc.mojo         # gpu_adc_search (stub)
 ├── tests/
 │   ├── test_rng.mojo
 │   ├── test_rotation.mojo
@@ -33,11 +37,15 @@ remex/mojo/
 │   ├── test_packed_vectors.mojo    # PackedVectors round-trip + at_precision parity
 │   ├── test_encode.mojo            # bit-identical encode parity vs Python
 │   ├── test_decode.mojo            # decode parity vs Python (full + coarse precision)
-│   └── test_search_twostage.mojo   # top-k parity for search_twostage vs Python
+│   ├── test_search_twostage.mojo   # top-k parity for search_twostage vs Python
+│   ├── test_gpu_encode.mojo        # encode parity for --device gpu (skipped without GPU)
+│   └── test_gpu_search.mojo        # ADC parity vs CPU for --device gpu (skipped without GPU)
 └── bench/
     ├── bench_encode.mojo
     ├── bench_search.mojo
     ├── bench_twostage.mojo
+    ├── bench_gpu_encode.mojo       # GPU encode timing (skipped without GPU)
+    ├── bench_gpu_search.mojo       # GPU ADC timing (skipped without GPU)
     └── compare.py           # Mojo vs NumPy comparison driver
 ```
 
@@ -216,6 +224,74 @@ python bench/compare.py --n 10000 --d 384 --bits 4 --queries 100 --k 10
 
 See `bench/RESULTS.md` (in this PR) for current numbers.
 
+## GPU / MAX path (`--device gpu`)
+
+**Status: scaffolding only.** The CLI flag, dispatch, test harness, and
+bench drivers are wired, but the kernels in `src/gpu/encode.mojo` and
+`src/gpu/adc.mojo` are stubs that raise `Error` until the real
+MAX-graph or kernel-launch implementation lands. Tracked by
+[issue #42](https://github.com/oaustegard/remex/issues/42).
+
+### Build
+
+The GPU build needs MAX with a CUDA-capable backend. CPU-only hosts
+(M-series Macs, generic Linux without an NVIDIA GPU) can still build
+and run the binaries — the GPU paths just refuse at runtime via
+`is_gpu_available()`, which lets the test/bench drivers skip cleanly.
+
+```bash
+# Same Mojo install as the CPU build.
+uv pip install --system --break-system-packages modular --no-deps
+uv pip install --system --break-system-packages mojo max
+
+# Build the CLI + GPU bench binaries (same flags as CPU).
+cd remex/mojo
+mojo build -I . polarquant.mojo                -o polarquant
+mojo build -I . bench/bench_gpu_encode.mojo    -o bench/bench_gpu_encode
+mojo build -I . bench/bench_gpu_search.mojo    -o bench/bench_gpu_search
+```
+
+### Run
+
+```bash
+# Encode + search on GPU (errors with a clear message until kernels land).
+./polarquant encode corpus.npy --bits 4 --params P.bin --device gpu -o corpus.pq
+./polarquant search corpus.pq query.npy --k 10 --params P.bin --device gpu --top 10
+```
+
+### Tests
+
+```bash
+# Skipped on CPU-only hosts; runs real parity checks on a GPU host.
+mojo run -I . tests/test_gpu_encode.mojo
+mojo run -I . tests/test_gpu_search.mojo
+```
+
+`test_gpu_encode.mojo` reuses the `/tmp/_parity_*` fixtures already
+generated for `test_encode.mojo` (see § Tests below). `test_gpu_search`
+is self-contained: it builds a synthetic corpus and asserts the GPU
+top-k matches the CPU `adc_search` baseline (rtol=1e-5 on scores,
+identical indices).
+
+### Acceptance for the kernel implementation
+
+Per issue #42:
+
+- `polarquant encode --device gpu` produces packed indices byte-identical
+  to the CPU path on the same input + `(R, codebook)`, modulo a
+  documented FP-order tolerance for boundary-adjacent coordinates.
+- `bench/RESULTS.md § Mojo port` gains a row for GPU encode + search
+  with timings benchmarked against a CuPy/PyTorch baseline on the same
+  GPU host (not against the Mojo CPU bench).
+
+### Why this is its own follow-up
+
+GPU work needs an NVIDIA host to validate. The kernel implementation
+doesn't gate on this scaffolding: anyone with a supported GPU can pick
+up `src/gpu/encode.mojo` and `src/gpu/adc.mojo`, replace the `raise
+Error(...)` body, and the rest of the pipeline (CLI, tests, bench)
+already works.
+
 ## Notes / known gaps
 
 - **Encode hot loop is SIMD-vectorized.** The per-row rotation matvec
@@ -231,8 +307,10 @@ See `bench/RESULTS.md` (in this PR) for current numbers.
   candidate selection is O(n*candidates). Mirrors the structure of
   `adc_search` in this port. Tighter inner-loop kernels — especially
   for the coarse-stage reduction at low precision — are a follow-up.
-- **No GPU.** The `coding-mojo` skill notes Claude.ai containers are
-  CPU-only; GPU work needs to be tested on a different host.
+- **GPU kernels are stubbed.** `--device gpu` is wired through the CLI,
+  tests, and bench drivers, but `src/gpu/encode.mojo` and
+  `src/gpu/adc.mojo` raise until the MAX implementation lands — see
+  the `## GPU / MAX path` section above and issue #42.
 - **Seed parity** with NumPy's `default_rng` is not bit-identical (see
   the table above). Implementing PCG64 + SeedSequence + Ziggurat in
   Mojo to match NumPy exactly is a separate, substantial effort. The
