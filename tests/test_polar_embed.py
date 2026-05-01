@@ -304,7 +304,12 @@ class TestDistributions:
         X = centers[labels] + rng.standard_normal((5000, d)).astype(np.float32) * 0.1
         X /= np.linalg.norm(X, axis=1, keepdims=True)
 
-        pq = Quantizer(d, bits=4)
+        # Use seed != 42 to decouple from the rng fixture (which is also
+        # default_rng(42)). Sharing the seed correlates the rotation with
+        # the test data and causes the proper-Haar rotation to under-perform
+        # on this specific cluster geometry — see notes in
+        # test_mse_below_upper_bound.
+        pq = Quantizer(d, bits=4, seed=0)
         comp = pq.encode(X)
         X_hat = pq.decode(comp)
 
