@@ -280,6 +280,27 @@ pytest tests/test_adc_gpu.py -v         # ADC and GPU searcher tests
 pytest tests/test_packed_vectors.py -v  # PackedVectors tests
 ```
 
+## Mojo port (`polarquant`)
+
+A standalone Mojo CLI binary lives in [`remex/mojo/`](remex/mojo/). It
+mirrors the encode + ADC search path with no Python runtime
+dependency, reading `.npy` corpus files directly and writing a small
+binary `.pq` container that the Python library can load via
+`remex.load_pq()` (and vice versa via `remex.save_pq()`).
+
+```bash
+cd remex/mojo
+mojo build -I . polarquant.mojo -o polarquant
+./polarquant encode corpus.npy --bits 4 --seed 42 -o corpus.pq
+./polarquant search corpus.pq query.npy --k 10 --seed 42
+```
+
+For bit-identical encoding to Python (matching rotations and
+codebook), use `--params P.bin` after dumping with
+`remex.save_params(quantizer, P)`. See
+[`remex/mojo/README.md`](remex/mojo/README.md) for build, test, and
+benchmark instructions.
+
 ## References
 
 - Zandieh et al. (2025). *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate.* ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
