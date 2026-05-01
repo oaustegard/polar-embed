@@ -7,3 +7,8 @@ build/
 *.npz
 bench/.specter2_cache/
 bench/plots/
+
+# Mojo build artifacts
+remex/mojo/polarquant
+remex/mojo/bench/bench_encode
+remex/mojo/bench/bench_search

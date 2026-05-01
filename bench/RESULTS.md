@@ -130,6 +130,42 @@ See [docs/specter2-case-study.md](../docs/specter2-case-study.md) for full analy
 
 Float32 baseline: 1,536 bytes/vector, 15.36 MB per 10k vectors.
 
+## Mojo port (`polarquant`) vs NumPy
+
+Standalone Mojo binary built from `remex/mojo/` (see issue #5 / the
+Mojo port PR). The Python and Mojo paths use **different** rotations
+(NumPy `default_rng` PCG64 + Ziggurat vs Mojo xoshiro256++ +
+Marsaglia polar) — both are valid Haar samples; the encoding is
+algorithmically identical given matching parameters. With `--params`
+mode (Python dumps R + codebook, Mojo loads them), `polarquant
+encode` produces a `.pq` byte-identical to Python's
+`save_pq(quantizer.encode(X))`.
+
+Wall-clock (n=10k, d=384, bits=4, queries=50, k=10, container CPU):
+
+| Stage           | NumPy    | Mojo (this PR) | Mojo / NumPy |
+|-----------------|---------:|---------------:|-------------:|
+| encode (µs/vec) |    52.3  |          222.5 |        4.3x slower |
+| ADC search (ms/q) |  21.1  |            3.8 |        5.5x faster |
+
+Mojo ADC search wins because the gather-heavy inner loop is
+straight-line scalar code that LLVM optimizes well, while the
+equivalent NumPy is bottlenecked on `np.outer` and chunk-wise
+gathers. Mojo encode loses to NumPy because NumPy's `X @ R.T` calls
+into BLAS (vendor SIMD), while the Mojo port currently uses a
+naive scalar matvec — vectorizing it via `std.algorithm.vectorize`
+is the obvious follow-up.
+
+Reproduce:
+
+```bash
+cd remex/mojo
+mojo build -I . polarquant.mojo            -o polarquant
+mojo build -I . bench/bench_encode.mojo    -o bench/bench_encode
+mojo build -I . bench/bench_search.mojo    -o bench/bench_search
+python bench/compare.py --n 10000 --d 384 --bits 4 --queries 50 --k 10
+```
+
 ## Reproducibility
 
 All benchmarks can be reproduced with:
