@@ -16,6 +16,7 @@ import warnings
 
 from remex.core import Quantizer, CompressedVectors, PackedVectors
 from remex.codebook import lloyd_max_codebook, nested_codebooks
+from remex.ivf import IVFCoarseIndex
 from remex.packing import pack, unpack, packed_nbytes
 from remex.pq_format import save_pq, load_pq, save_params
 
@@ -23,6 +24,7 @@ __version__ = "0.5.0"
 __all__ = [
     "Quantizer", "CompressedVectors", "PackedVectors",
     "PolarQuantizer",  # deprecated alias
+    "IVFCoarseIndex",
     "lloyd_max_codebook", "nested_codebooks",
     "pack", "unpack", "packed_nbytes",
     "save_pq", "load_pq", "save_params",

@@ -34,7 +34,7 @@ from scipy import stats
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from remex import Quantizer
+from remex import IVFCoarseIndex, Quantizer
 from remex.rotation import haar_rotation
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".specter2_cache")
@@ -502,6 +502,338 @@ def benchmark_recall(
 
 
 # ---------------------------------------------------------------------------
+# IVF coarse-tier benchmark
+# ---------------------------------------------------------------------------
+
+
+def _time_per_query(
+    fn, queries: np.ndarray, warmup: int = 3, repeats: int = 1
+) -> float:
+    """Return median per-query wall-clock latency (ms)."""
+    n = queries.shape[0]
+    # Warm up: BLAS, page-cache, etc.
+    for i in range(min(warmup, n)):
+        fn(queries[i])
+
+    timings = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        for i in range(n):
+            fn(queries[i])
+        elapsed = time.perf_counter() - t0
+        timings.append(elapsed / n * 1000.0)
+    return float(np.median(timings))
+
+
+def benchmark_ivf(
+    corpus: np.ndarray,
+    d: int,
+    label: str,
+    n_queries: int = 100,
+    seed: int = 99,
+    bits: int = 8,
+    coarse_precision: int = 1,
+    candidates: int = 500,
+    n_bits_list=(8, 10, 12),
+    nprobe_pcts=(1, 2, 5, 10, 25, 50, 100),
+    bridge_corpus: np.ndarray = None,
+) -> list:
+    """IVFCoarseIndex latency-recall sweep against flat-scan baseline.
+
+    Encodes the corpus at ``bits`` precision (default 8-bit, matching
+    the SS deployment), then for each (mode, n_bits) configuration
+    sweeps ``nprobe`` and reports:
+
+      - per-query coarse latency (ms) vs flat-scan baseline
+      - Recall@K of stage-1 candidate set against the flat-scan stage-1
+        result (i.e. how much recall is preserved after restricting to
+        the visited cells, before fine rerank)
+      - End-to-end Recall@10 after fine rerank vs the exact KNN truth
+
+    If ``bridge_corpus`` is provided, also runs a cross-partition
+    bridge preservation spot-check: for queries from the host corpus,
+    we look at how many of their flat-scan top-K neighbors come from
+    the bridge corpus (cross-partition hits), and whether the IVF
+    top-K preserves that count.
+
+    Args:
+        corpus: ``(n, d)`` host corpus to search.
+        d: Vector dimension.
+        label: Label for printed output.
+        n_queries: Number of queries to use (held out from corpus).
+        seed: Split seed.
+        bits: Quantizer precision.
+        coarse_precision: Stage-1 ADC bit precision (1 = 1-bit Matryoshka).
+        candidates: Stage-1 candidate count for two-stage rerank.
+        n_bits_list: IVF ``n_bits`` values to sweep.
+        nprobe_pcts: ``nprobe`` as percentage of ``n_cells`` to sweep.
+        bridge_corpus: Optional second-partition corpus for cross-FoS
+            bridge preservation spot-check.
+
+    Returns:
+        List of result dicts with keys:
+            mode, n_bits, n_cells, nprobe, candidate_pool_pct,
+            recall10_coarse, recall100_coarse, recall10_ts, latency_ms,
+            speedup, bridge_preservation (if bridge_corpus given).
+    """
+    rng = np.random.default_rng(seed)
+    n = corpus.shape[0]
+    if n <= n_queries:
+        n_queries = max(20, n // 10)
+
+    perm = rng.permutation(n)
+    query_idx = perm[:n_queries]
+    corpus_idx = perm[n_queries:]
+    queries = corpus[query_idx]
+    search_corpus = corpus[corpus_idx]
+    n_search = search_corpus.shape[0]
+
+    # If a bridge corpus is provided, append it to the search corpus.
+    # Track the boundary so we can count cross-partition hits.
+    bridge_offset = None
+    if bridge_corpus is not None:
+        bridge_offset = n_search
+        search_corpus = np.concatenate([search_corpus, bridge_corpus], axis=0)
+
+    print(f"\n{'='*60}")
+    print(f"  IVF Coarse-Tier Benchmark: {label}")
+    print(f"  Search corpus: {search_corpus.shape[0]}, Queries: {n_queries}, d={d}")
+    print(f"  Encoding: {bits}-bit, coarse precision: {coarse_precision}-bit, "
+          f"candidates: {candidates}")
+    if bridge_offset is not None:
+        print(f"  Bridge corpus appended at offset {bridge_offset} "
+              f"(+{bridge_corpus.shape[0]} vectors)")
+    print(f"{'='*60}")
+
+    # --- Encode + ground truth + flat baseline ---
+    pq = Quantizer(d=d, bits=bits, seed=42)
+    print("  Encoding corpus...")
+    t0 = time.perf_counter()
+    compressed = pq.encode(search_corpus)
+    print(f"    encoded {search_corpus.shape[0]} vectors in {time.perf_counter()-t0:.2f}s")
+
+    # Exact KNN truth (top-100, full precision)
+    print("  Computing exact KNN truth...")
+    truth = exact_knn(search_corpus, queries, k=100)
+
+    # Flat-scan stage-1 candidate set as a reference for "perfect coarse recall".
+    # Stage-1 recall is: how well do the candidates align with this baseline?
+    print("  Running flat-scan baseline...")
+    flat_coarse_idx = []
+    flat_ts_idx = []
+    for q in queries:
+        idx_c, _ = pq.search_adc(
+            compressed, q, k=candidates, precision=coarse_precision
+        )
+        flat_coarse_idx.append(idx_c)
+        idx_ts, _ = pq.search_twostage(
+            compressed, q, k=10, candidates=candidates,
+            coarse_precision=coarse_precision,
+        )
+        flat_ts_idx.append(idx_ts)
+    flat_coarse_idx = np.stack(flat_coarse_idx)
+    flat_ts_idx = np.stack(flat_ts_idx)
+
+    flat_recall_truth = recall_at_k(flat_ts_idx, truth[:, :10], 10)
+    flat_lat = _time_per_query(
+        lambda q: pq.search_adc(
+            compressed, q, k=candidates, precision=coarse_precision
+        ),
+        queries,
+    )
+
+    # Bridge baseline: how many cross-partition hits does the flat scan see?
+    flat_bridge_count = None
+    if bridge_offset is not None:
+        flat_bridge_count = _count_bridge_hits(flat_ts_idx, bridge_offset)
+
+    print(f"\n  Flat-scan baseline:")
+    print(f"    Coarse latency:           {flat_lat:.2f} ms/query")
+    print(f"    Two-stage R@10 vs truth:  {flat_recall_truth:.4f}")
+    if flat_bridge_count is not None:
+        print(f"    Bridge hits (mean):       "
+              f"{flat_bridge_count:.2f} of 10 top-K cross-partition")
+
+    # --- IVF sweep ---
+    print(f"\n  IVF sweep — modes × n_bits × nprobe:")
+    header = (
+        f"  {'mode':<14s} {'n_bits':>6s} {'nprobe':>7s} {'pool%':>6s} "
+        f"{'R@10/coarse':>12s} {'R@100/coarse':>13s} {'R@10/ts':>9s} "
+        f"{'lat ms':>8s} {'speedup':>8s}"
+    )
+    if flat_bridge_count is not None:
+        header += f" {'bridge':>7s}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    results = []
+    for mode in ("rotated_prefix", "lsh"):
+        for n_bits in n_bits_list:
+            if mode == "rotated_prefix" and n_bits > d:
+                continue
+            t0 = time.perf_counter()
+            ivf = IVFCoarseIndex(
+                pq, compressed, n_bits=n_bits, mode=mode, seed=0
+            )
+            build_s = time.perf_counter() - t0
+            stats = ivf.cell_size_stats()
+
+            # Print build summary
+            print(f"  -- {mode}/{n_bits}-bit: built in {build_s:.2f}s, "
+                  f"cells={stats['n_cells']}, "
+                  f"nonempty={stats['nonempty_cells']}, "
+                  f"min/mean/max={stats['min']}/{stats['mean']:.0f}/{stats['max']}, "
+                  f"index={ivf.index_nbytes/1e6:.1f} MB")
+
+            for nprobe_pct in nprobe_pcts:
+                nprobe = max(1, int(round(ivf.n_cells * nprobe_pct / 100.0)))
+                if nprobe >= ivf.n_cells:
+                    nprobe = ivf.n_cells
+
+                # Stage-1 only (for coarse recall)
+                ivf_coarse_idx = []
+                cand_counts = []
+                for q in queries:
+                    cand_counts.append(ivf.candidate_count(q, nprobe))
+                    idx_c, _ = ivf.search_coarse(
+                        q,
+                        k=candidates,
+                        nprobe=nprobe,
+                        precision=coarse_precision,
+                    )
+                    ivf_coarse_idx.append(idx_c)
+                # "Pool" = candidate corpus rows actually scanned by ADC
+                # (before truncation to top-`candidates`). This is the
+                # quantity that drives stage-1 latency.
+                avg_pool = float(np.mean(cand_counts))
+                pool_pct = avg_pool / search_corpus.shape[0] * 100
+
+                r10_coarse = _set_recall(
+                    ivf_coarse_idx, flat_coarse_idx, k=10
+                )
+                r100_coarse = _set_recall(
+                    ivf_coarse_idx, flat_coarse_idx, k=100
+                )
+
+                # Two-stage end-to-end
+                ivf_ts_idx = []
+                for q in queries:
+                    idx_ts, _ = ivf.search_twostage(
+                        q,
+                        k=10,
+                        candidates=candidates,
+                        nprobe=nprobe,
+                        coarse_precision=coarse_precision,
+                    )
+                    # Pad short results with -1 so recall_at_k compares correctly
+                    if len(idx_ts) < 10:
+                        pad = np.full(10 - len(idx_ts), -1, dtype=idx_ts.dtype)
+                        idx_ts = np.concatenate([idx_ts, pad])
+                    ivf_ts_idx.append(idx_ts)
+                ivf_ts_idx = np.stack(ivf_ts_idx)
+                r10_ts = recall_at_k(ivf_ts_idx, truth[:, :10], 10)
+
+                lat = _time_per_query(
+                    lambda q, _np=nprobe: ivf.search_coarse(
+                        q,
+                        k=candidates,
+                        nprobe=_np,
+                        precision=coarse_precision,
+                    ),
+                    queries,
+                )
+                speedup = flat_lat / max(lat, 1e-6)
+
+                bridge_pres = None
+                if flat_bridge_count is not None:
+                    ivf_bridge_count = _count_bridge_hits(
+                        ivf_ts_idx, bridge_offset
+                    )
+                    if flat_bridge_count > 1e-6:
+                        bridge_pres = ivf_bridge_count / flat_bridge_count
+                    else:
+                        bridge_pres = float("nan")
+
+                row = f"  {mode:<14s} {n_bits:>6d} {nprobe:>7d} {pool_pct:>5.1f}% "
+                row += f"{r10_coarse:>12.4f} {r100_coarse:>13.4f} {r10_ts:>9.4f} "
+                row += f"{lat:>7.2f}m {speedup:>7.2f}x"
+                if bridge_pres is not None:
+                    row += f" {bridge_pres:>7.2f}"
+                print(row)
+
+                rec = {
+                    "label": label,
+                    "mode": mode,
+                    "n_bits": n_bits,
+                    "n_cells": ivf.n_cells,
+                    "nprobe": nprobe,
+                    "candidate_pool_pct": pool_pct,
+                    "recall10_coarse": r10_coarse,
+                    "recall100_coarse": r100_coarse,
+                    "recall10_ts": r10_ts,
+                    "latency_ms": lat,
+                    "speedup": speedup,
+                    "build_s": build_s,
+                    "index_mb": ivf.index_nbytes / 1e6,
+                }
+                if bridge_pres is not None:
+                    rec["bridge_preservation"] = bridge_pres
+                results.append(rec)
+
+    print()
+    print("  Notes:")
+    print("    pool%       = mean candidate pool size / corpus size")
+    print("    R@10/coarse = stage-1 candidate-set recall vs flat-scan stage-1 (top-10)")
+    print("    R@10/ts     = end-to-end Recall@10 after fine rerank vs exact KNN truth")
+    print("    speedup     = flat-scan latency / IVF latency for stage-1")
+    if flat_bridge_count is not None:
+        print(f"    bridge      = IVF cross-partition hits / flat cross-partition hits "
+              f"(flat baseline = {flat_bridge_count:.2f} of 10)")
+
+    # Concise verdict
+    print()
+    print("  Verdict heuristics:")
+    rotated_results = [r for r in results if r["mode"] == "rotated_prefix"]
+    lsh_results = [r for r in results if r["mode"] == "lsh"]
+    for tag, rs in [("rotated_prefix", rotated_results), ("lsh", lsh_results)]:
+        if not rs:
+            continue
+        # Find configurations that meet recall ≥ 0.95 vs flat two-stage
+        target = max(0.95 * flat_recall_truth, 0.0)
+        good = [r for r in rs if r["recall10_ts"] >= target]
+        if good:
+            best = max(good, key=lambda r: r["speedup"])
+            print(f"    {tag:<14s}: best speedup at R@10≥{target:.3f}: "
+                  f"{best['speedup']:.2f}x at n_bits={best['n_bits']}, "
+                  f"nprobe={best['nprobe']}, pool={best['candidate_pool_pct']:.1f}%")
+        else:
+            best_recall = max(rs, key=lambda r: r["recall10_ts"])
+            print(f"    {tag:<14s}: never reached R@10={target:.3f}; "
+                  f"best R@10={best_recall['recall10_ts']:.3f} at n_bits="
+                  f"{best_recall['n_bits']}, nprobe={best_recall['nprobe']}")
+
+    return results
+
+
+def _count_bridge_hits(idx_array: np.ndarray, bridge_offset: int) -> float:
+    """Mean count of top-K results from the bridge corpus per query."""
+    cross = idx_array >= bridge_offset
+    return float(cross.sum(axis=1).mean())
+
+
+def _set_recall(pred_lists, truth_lists, k: int) -> float:
+    """Set-overlap recall@k where ``pred_lists`` may have variable length."""
+    hits = 0
+    for pred, truth in zip(pred_lists, truth_lists):
+        pred_set = set(pred[: min(k, len(pred))].tolist())
+        truth_set = set(truth[: min(k, len(truth))].tolist())
+        if len(truth_set) == 0:
+            continue
+        hits += len(pred_set & truth_set)
+    return hits / (len(pred_lists) * k)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -558,8 +890,20 @@ def main():
                         help="Save distribution plots (requires matplotlib)")
     parser.add_argument("--skip-recall", action="store_true",
                         help="Skip recall benchmark (distribution analysis only)")
+    parser.add_argument("--skip-ivf", action="store_true",
+                        help="Skip IVF coarse-tier latency-recall benchmark")
+    parser.add_argument("--only-ivf", action="store_true",
+                        help="Run only the IVF benchmark (skip distribution + recall)")
     parser.add_argument("-n", "--num-vectors", type=int, default=TARGET_N,
                         help=f"Number of vectors per partition (default: {TARGET_N})")
+    parser.add_argument("--ivf-queries", type=int, default=100,
+                        help="Number of queries for IVF benchmark (default: 100)")
+    parser.add_argument("--ivf-bits", type=int, default=8,
+                        help="Quantization bits for IVF benchmark (default: 8)")
+    parser.add_argument("--ivf-coarse-precision", type=int, default=1,
+                        help="Stage-1 ADC precision for IVF benchmark (default: 1)")
+    parser.add_argument("--ivf-candidates", type=int, default=500,
+                        help="Stage-1 candidate count for IVF benchmark (default: 500)")
     args = parser.parse_args()
 
     d = SPECTER2_DIM
@@ -585,18 +929,17 @@ def main():
     )
 
     # --- Distribution analysis ---
-    dist_broad = analyze_rotation_distribution(
-        corpus_broad, d, "SPECTER2 — Broad (NLP)", save_plots=args.plots
-    )
-    dist_narrow = analyze_rotation_distribution(
-        corpus_narrow, d, "SPECTER2 — Narrow (Transformer Attention)", save_plots=args.plots
-    )
-
-    # --- Comparison ---
-    compare_partitions(dist_broad, dist_narrow)
+    if not args.only_ivf:
+        dist_broad = analyze_rotation_distribution(
+            corpus_broad, d, "SPECTER2 — Broad (NLP)", save_plots=args.plots
+        )
+        dist_narrow = analyze_rotation_distribution(
+            corpus_narrow, d, "SPECTER2 — Narrow (Transformer Attention)", save_plots=args.plots
+        )
+        compare_partitions(dist_broad, dist_narrow)
 
     # --- Recall benchmark ---
-    if not args.skip_recall:
+    if not args.skip_recall and not args.only_ivf:
         recall_broad = benchmark_recall(corpus_broad, d, "SPECTER2 — Broad (NLP)")
         recall_narrow = benchmark_recall(corpus_narrow, d, "SPECTER2 — Narrow (Transformer Attention)")
 
@@ -608,6 +951,31 @@ def main():
         for rb, rn in zip(recall_broad, recall_narrow):
             gap = rb["recall_10"] - rn["recall_10"]
             print(f"  {rb['method']:<20s} {rb['recall_10']:>11.3f} {rn['recall_10']:>11.3f} {gap:>+7.3f}")
+
+    # --- IVF coarse-tier benchmark ---
+    if not args.skip_ivf:
+        # Broad-only IVF sweep first (single partition).
+        benchmark_ivf(
+            corpus_broad,
+            d,
+            "SPECTER2 — Broad (NLP)",
+            n_queries=args.ivf_queries,
+            bits=args.ivf_bits,
+            coarse_precision=args.ivf_coarse_precision,
+            candidates=args.ivf_candidates,
+        )
+        # Cross-partition bridge sweep: search broad corpus + narrow corpus
+        # together to test bridge edge preservation.
+        benchmark_ivf(
+            corpus_broad,
+            d,
+            "SPECTER2 — Broad host + Narrow bridge",
+            n_queries=args.ivf_queries,
+            bits=args.ivf_bits,
+            coarse_precision=args.ivf_coarse_precision,
+            candidates=args.ivf_candidates,
+            bridge_corpus=corpus_narrow,
+        )
 
     print(f"\n{'='*60}")
     print("  Done.")

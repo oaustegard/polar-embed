@@ -213,6 +213,87 @@ indices, scores = searcher.search_adc(query, k=10)
 indices, scores = searcher.search_twostage(query, k=10, candidates=200)
 ```
 
+### `IVFCoarseIndex` (sublinear coarse-tier scan)
+
+Inverted-file index over the coarse Matryoshka tier. Lets you visit
+only `nprobe` of `2**n_bits` cells per query, replacing the
+bandwidth-bound flat coarse scan in two-stage retrieval. **Stays
+data-oblivious** — no k-means, no training, no fitting.
+
+```python
+from remex import IVFCoarseIndex, Quantizer
+
+pq = Quantizer(d=768, bits=8, seed=42)
+compressed = pq.encode(corpus)              # CompressedVectors or PackedVectors
+
+# Mode 1: random-hyperplane LSH (SimHash). Pure data-oblivious — works
+# on any embedding distribution. Determined by (d, n_bits, seed).
+ivf = IVFCoarseIndex(pq, compressed, n_bits=12, mode="lsh", seed=0)
+
+# Mode 2: sign of the first n_bits post-rotation coords. Free given
+# the existing rotation (these bits are already MSBs of the encoded
+# indices). Cell balance depends on rotated coords being ~i.i.d.
+# Gaussian, which is checked by bench/specter2_eval.py.
+ivf = IVFCoarseIndex(pq, compressed, n_bits=12, mode="rotated_prefix")
+
+# Stage-1 only — top-K candidates from the visited cells, ADC scored
+indices, scores = ivf.search_coarse(query, k=500, nprobe=8, precision=1)
+
+# End-to-end: IVF coarse + full-precision rerank
+indices, scores = ivf.search_twostage(
+    query, k=10, candidates=500, nprobe=8, coarse_precision=1
+)
+```
+
+Multi-probe is by Hamming distance from the query's hash code: the
+`nprobe` cells with the lowest Hamming distance to `q_hash` are
+visited (ties broken by cell ID). Setting `nprobe = 2**n_bits`
+recovers a flat scan; the index is exact in that limit and tests
+verify byte-identical agreement with `Quantizer.search_adc` /
+`Quantizer.search_twostage`.
+
+#### When IVF wins, when flat-scan wins
+
+IVF is for the regime where stage-1 latency is the bottleneck (≥ tens
+of millions of vectors). The trade-off is recall vs latency:
+
+| `nprobe` / `n_cells` | Pool scanned | Recall vs flat | Speedup |
+|---|---|---|---|
+| 1 / 2^b | ~1/2^b of corpus | low — only same-cell neighbors | up to ~2^b |
+| ~5–25% | ~5–25% of corpus | typical 0.85–0.95 R@10 | 4–20× |
+| 100% | full corpus | 1.0 (bit-identical to flat) | 0.95–1.0× |
+
+Flat-scan wins when:
+
+- Corpus < ~10M vectors. Stage-1 is already < 50 ms; the IVF index
+  overhead and per-query hash cost don't pay back.
+- Recall@K must equal flat-scan exactly. IVF is approximate by
+  construction — vectors in unvisited cells are missed.
+- Embeddings are deeply mixed and queries are uniformly distributed
+  in angle, so cells don't capture meaningful neighborhoods.
+
+Bridge-edge preservation (cross-FoS / cross-partition recall) is
+benchmarked explicitly in `bench/specter2_eval.py` — running broad +
+narrow SPECTER2 partitions concatenated and reporting how many of the
+flat-scan top-K cross-partition hits the IVF top-K preserves at each
+`nprobe`. Both hash modes are content-based (hyperplane signs on the
+rotated representation), so they don't partition by FoS — but at very
+low `nprobe` cross-partition hits drop simply because pool size
+shrinks.
+
+#### Memory cost (excluding the corpus)
+
+| Component | Bytes |
+|---|---|
+| `cell_ids` | `2 * n` |
+| `sorted_idx` | `8 * n` |
+| `cell_offsets` | `8 * (2**n_bits + 1)` |
+| `hyperplanes` (lsh only) | `4 * n_bits * d` |
+
+For 100M vectors at `n_bits=12`: ~960 MB index overhead vs ~9.6 GB
+1-bit coarse memory — about 10% surcharge for ~5–20× stage-1 speedup
+at moderate `nprobe`.
+
 ### Memory profiles (100k vectors, d=384, 8-bit)
 
 | Strategy | Resident RAM | ms/query |
