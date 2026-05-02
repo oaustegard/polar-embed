@@ -1,7 +1,7 @@
 # Benchmark Results
 
-**Date**: 2026-04-05
-**Library version**: remex 0.5.0
+**Date**: 2026-04-05 (recall, distribution, SPECTER2) · 2026-05-01 (Mojo twostage refresh, PR [#51](https://github.com/oaustegard/remex/pull/51))
+**Library version**: remex 0.5.1
 **Hardware**: CPU (NumPy), no GPU
 **Seeds**: corpus seed=42, query seed=99, quantizer seed=42
 
@@ -132,7 +132,10 @@ Float32 baseline: 1,536 bytes/vector, 15.36 MB per 10k vectors.
 
 ## Mojo port (`remex` Mojo CLI) vs NumPy
 
-Standalone Mojo binary built from [`mojo/`](../mojo/) (issue #5).
+Standalone Mojo binary built from [`mojo/`](../mojo/) (issue #5). Full Mojo-vs-NumPy
+results — including the build matrix, reproduce commands, and PR-by-PR history
+— live in [`mojo/bench/RESULTS.md`](../mojo/bench/RESULTS.md).
+Headline numbers below.
 
 Since [#40](https://github.com/oaustegard/remex/issues/40), Mojo's
 default `--seed S` path uses the same RNG stack as NumPy
@@ -150,22 +153,26 @@ all-bit-widths bridge.) See [`mojo/README.md#two-parameter-modes`](../mojo/READM
 |--------------------|---------:|--------:|--------:|
 | encode (µs/vec)    |     17.0 |    13.3 | **1.27x** |
 | ADC search (ms/q)  |     16.4 |     2.7 | **6.0x**  |
-| twostage (ms/q)    |     17.3 |    19.0 | 0.91x   |
+| twostage (ms/q)    |     17.6 |     3.2 | **5.5x**  |
 
-#### Scaling across `d` (1 trial each, indicative)
+#### Scaling across `d`
+
+twostage row is post-[#51](https://github.com/oaustegard/remex/pull/51)
+(min-heap coarse top-k, 5-trial median); encode and search rows are 1-trial
+indicative pre-#51 measurements.
 
 | `d`  | NumPy encode (µs) | Mojo encode (µs) | encode speedup | NumPy search (ms) | Mojo search (ms) | search speedup | NumPy twostage (ms) | Mojo twostage (ms) | twostage speedup |
 |-----:|------------------:|-----------------:|---------------:|------------------:|-----------------:|---------------:|--------------------:|-------------------:|-----------------:|
-|   64 |              3.65 |             1.72 |          2.12x |              2.99 |             0.70 |          4.30x |                3.24 |              16.59 |            0.20x |
-|  256 |             13.21 |             8.24 |          1.60x |             11.63 |             1.85 |          6.28x |               12.38 |              17.60 |            0.70x |
-|  384 |             ~17.0 |            ~13.3 |          1.27x |             16.40 |             2.71 |          6.01x |               17.26 |              19.00 |            0.91x |
-|  768 |             44.52 |            39.65 |          1.12x |             36.28 |             5.36 |          6.77x |               36.69 |              23.58 |          **1.56x** |
+|   64 |              3.65 |             1.72 |          2.12x |              2.99 |             0.70 |          4.30x |                3.42 |               0.51 |          **6.7x** |
+|  256 |             13.21 |             8.24 |          1.60x |             11.63 |             1.85 |          6.28x |               11.40 |               2.01 |          **5.7x** |
+|  384 |             ~17.0 |            ~13.3 |          1.27x |             16.40 |             2.71 |          6.01x |               17.59 |               3.18 |          **5.5x** |
+|  768 |             44.52 |            39.65 |          1.12x |             36.28 |             5.36 |          6.77x |               37.60 |               6.21 |          **6.1x** |
 
 ### Notes
 
 - **Encode** crossed from 1.3x slower (initial port, scalar matvec, `_dot_f32` only) to 1.27x faster after [#37](https://github.com/oaustegard/remex/pull/37) (SIMD vectorization) + [#41](https://github.com/oaustegard/remex/issues/41) (NB=8 row-blocking through `_dot_block_8`). The float64-accumulator norm change in [#40](https://github.com/oaustegard/remex/issues/40) (needed for byte parity vs Python's `np.linalg.norm`) did not measurably regress encode speed — norm is a tiny fraction of the encode hot path.
 - **ADC search** wins consistently (4–7×) because Mojo's gather-then-scalar-add inner loop auto-vectorizes well; NumPy's equivalent is bottlenecked on per-chunk `np.outer` + `table[idx]` gathers.
-- **Twostage** is the weak spot. Mojo's `search_twostage` time is roughly d-independent (~17–24 ms across all d), while NumPy scales with d. Mojo loses at small d (5× slower at d=64) and wins at large d (1.56× faster at d=768). The dominant cost is the O(n·candidates) selection-style coarse top-k loop in `search_twostage` — flagged as "naive" in `mojo/README.md#known-gaps`. A min-heap or quickselect would drop that to O(n log k) ≈ 90× fewer ops at n=10k, candidates=500.
+- **Twostage** was the weak spot before [#51](https://github.com/oaustegard/remex/pull/51): the O(n·candidates) selection-style coarse top-k loop made Mojo slower than NumPy at d ≤ 384 (0.20× at d=64). PR #51 replaced that with a min-heap walked once over `n` scores — O(n·k) → O(n log k), ~90× fewer comparisons at the default (n=10k, candidates=500). Mojo `search_twostage` is now consistently 5.5–6.7× faster than NumPy across all d, restoring it as the right default for memory-constrained workloads (single-stage `search`-cached speed at 4× less memory). The next bottleneck on the coarse pass is the per-row gather+arithmetic in ADC scoring, addressed by PR [#52](https://github.com/oaustegard/remex/pull/52) (closing #50) (~1.5–2× further estimated).
 - **Encode advantage at d=768** shrinks to 1.12× — the matvec hits memory bandwidth limits, so Mojo and NumPy's BLAS converge.
 
 ### Reproduce
