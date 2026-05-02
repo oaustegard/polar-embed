@@ -497,15 +497,18 @@ class Quantizer:
         if X.shape[1] != self.d:
             raise ValueError(f"Expected d={self.d}, got {X.shape[1]}")
 
-        norms = np.linalg.norm(X, axis=1)
+        # Compute norms in float64, cast to float32. Removes the 1-ULP
+        # reduction-order divergence between BLAS (np.linalg.norm) and
+        # Mojo's SIMD reduce_add — needed for byte-identical .pq parity
+        # with the Mojo encoder.
+        norms64 = np.sqrt(np.sum(X.astype(np.float64) ** 2, axis=1))
+        norms = norms64.astype(np.float32)
         X_unit = X / np.maximum(norms, 1e-8)[:, None]
         X_rot = X_unit @ self.R.T
 
         indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
 
-        return CompressedVectors(
-            indices, norms.astype(np.float32), self.d, self.bits
-        )
+        return CompressedVectors(indices, norms, self.d, self.bits)
 
     def decode(
         self, compressed: CompressedVectors, precision: Optional[int] = None
