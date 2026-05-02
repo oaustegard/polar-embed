@@ -923,7 +923,7 @@ def main():
     )
     corpus_narrow = load_or_fetch(
         "transformer attention mechanism",
-        "specter2_transformer_narrow",
+        "specter2_nlp_narrow",
         target_n=target_n,
         use_cache=args.cached,
     )
