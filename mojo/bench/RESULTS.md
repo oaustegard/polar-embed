@@ -51,6 +51,7 @@ indicative measurements (pre-#51, unaffected by it).
 | 2026-04 | [#40](https://github.com/oaustegard/remex/issues/40) | encode | float64-accumulator norm for byte parity | unchanged hot path |
 | 2026-04 | [#48](https://github.com/oaustegard/remex/pull/48) | bench | Refresh; flagged twostage as weak spot | 19.0 ms (0.91×) |
 | 2026-05 | [#51](https://github.com/oaustegard/remex/pull/51) | twostage | Min-heap coarse top-k (O(n·k) → O(n log k)) | 3.18 ms (5.5×) |
+| 2026-05 | [#52](https://github.com/oaustegard/remex/pull/52) | twostage | NB=8 row-block of coarse-stage ADC scoring (#50) | not re-benched |
 
 ## Notes
 
@@ -66,9 +67,11 @@ indicative measurements (pre-#51, unaffected by it).
   loop with a min-heap walked once over `n` scores — ~90× fewer comparisons
   at the default (n=10k, candidates=500). Now consistently 5.5–6.7× faster
   than NumPy across all d.
-- **Next bottleneck**: per-row gather+arithmetic in coarse-stage ADC scoring,
-  tracked by [#50](https://github.com/oaustegard/remex/issues/50). Estimated
-  ~1.5–2× further on the coarse pass.
+- **Coarse-stage row-block (PR [#52](https://github.com/oaustegard/remex/pull/52))**:
+  per-row gather+arithmetic in coarse-stage ADC scoring is now NB=8
+  row-blocked, addressing [#50](https://github.com/oaustegard/remex/issues/50).
+  Numbers in this file are post-#51 but pre-#52 — re-run `bench/compare.py`
+  to pick up the additional speedup.
 
 ## Build
 
