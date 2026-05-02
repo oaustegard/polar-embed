@@ -13,7 +13,7 @@ Fixtures expected at:
   /tmp/_parity_X.npy
   /tmp/_parity.params
   /tmp/_parity_ref.pq
-(Generate with the snippet in remex/mojo/README.md § Tests.)
+(Generate with the snippet in mojo/README.md § Tests.)
 """
 
 from std.testing import assert_equal, assert_true

@@ -1,7 +1,7 @@
-# Mojo `polarquant` vs NumPy `remex` — Benchmark Results
+# Mojo `remex` vs NumPy `remex` — Benchmark Results
 
 **Last refreshed**: 2026-05-01 (twostage post-[#51](https://github.com/oaustegard/remex/pull/51))
-**Library version**: remex 0.5.1 · `polarquant` Mojo binary
+**Library version**: remex 0.5.1 · `remex` Mojo binary
 **Hardware**: container CPU (no GPU)
 **Seeds**: corpus seed=42, query seed=99, quantizer seed=42
 **Workload**: n=10000, bits=4, k=10
@@ -10,7 +10,7 @@ This file lives next to the comparison driver
 ([`compare.py`](compare.py)) and the per-stage bench binaries
 (`bench_encode.mojo`, `bench_search.mojo`, `bench_twostage.mojo`).
 For broader recall, distribution, and SPECTER2 results see
-[`bench/RESULTS.md`](../../../bench/RESULTS.md) at the repo root.
+[`bench/RESULTS.md`](../../bench/RESULTS.md) at the repo root.
 
 ## RNG parity (since [#40](https://github.com/oaustegard/remex/issues/40))
 
@@ -51,6 +51,7 @@ indicative measurements (pre-#51, unaffected by it).
 | 2026-04 | [#40](https://github.com/oaustegard/remex/issues/40) | encode | float64-accumulator norm for byte parity | unchanged hot path |
 | 2026-04 | [#48](https://github.com/oaustegard/remex/pull/48) | bench | Refresh; flagged twostage as weak spot | 19.0 ms (0.91×) |
 | 2026-05 | [#51](https://github.com/oaustegard/remex/pull/51) | twostage | Min-heap coarse top-k (O(n·k) → O(n log k)) | 3.18 ms (5.5×) |
+| 2026-05 | [#52](https://github.com/oaustegard/remex/pull/52) | twostage | NB=8 row-block of coarse-stage ADC scoring (#50) | not re-benched |
 
 ## Notes
 
@@ -66,16 +67,18 @@ indicative measurements (pre-#51, unaffected by it).
   loop with a min-heap walked once over `n` scores — ~90× fewer comparisons
   at the default (n=10k, candidates=500). Now consistently 5.5–6.7× faster
   than NumPy across all d.
-- **Next bottleneck**: per-row gather+arithmetic in coarse-stage ADC scoring,
-  tracked by [#50](https://github.com/oaustegard/remex/issues/50). Estimated
-  ~1.5–2× further on the coarse pass.
+- **Coarse-stage row-block (PR [#52](https://github.com/oaustegard/remex/pull/52))**:
+  per-row gather+arithmetic in coarse-stage ADC scoring is now NB=8
+  row-blocked, addressing [#50](https://github.com/oaustegard/remex/issues/50).
+  Numbers in this file are post-#51 but pre-#52 — re-run `bench/compare.py`
+  to pick up the additional speedup.
 
 ## Build
 
 ```bash
-cd remex/mojo
+cd mojo
 
-mojo build -I . polarquant.mojo            -o polarquant
+mojo build -I . remex.mojo                 -o remex
 mojo build -I . bench/bench_encode.mojo    -o bench/bench_encode
 mojo build -I . bench/bench_search.mojo    -o bench/bench_search
 mojo build -I . bench/bench_twostage.mojo  -o bench/bench_twostage
@@ -89,14 +92,14 @@ The container needs the Mojo compiler — see
 The headline numbers above:
 
 ```bash
-cd remex/mojo
+cd mojo
 python bench/compare.py --n 10000 --d 384 --bits 4 --queries 100 --k 10
 ```
 
 Scaling sweep (re-runs `compare.py` per `d`):
 
 ```bash
-cd remex/mojo
+cd mojo
 for d in 64 256 384 768; do
   python bench/compare.py --n 10000 --d $d --bits 4 --queries 100 --k 10
 done
@@ -105,7 +108,7 @@ done
 Individual stages directly:
 
 ```bash
-cd remex/mojo
+cd mojo
 ./bench/bench_encode    --n 10000 --d 384 --bits 4 --seed 42
 ./bench/bench_search    --n 10000 --d 384 --bits 4 --queries 100 --k 10 --seed 42
 ./bench/bench_twostage  --n 10000 --d 384 --bits 4 --queries 100 --k 10 --seed 42 \

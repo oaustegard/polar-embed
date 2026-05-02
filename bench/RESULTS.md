@@ -130,11 +130,11 @@ See [docs/specter2-case-study.md](../docs/specter2-case-study.md) for full analy
 
 Float32 baseline: 1,536 bytes/vector, 15.36 MB per 10k vectors.
 
-## Mojo port (`polarquant`) vs NumPy
+## Mojo port (`remex` Mojo CLI) vs NumPy
 
-Standalone Mojo binary built from `remex/mojo/` (issue #5). Full Mojo-vs-NumPy
+Standalone Mojo binary built from [`mojo/`](../mojo/) (issue #5). Full Mojo-vs-NumPy
 results — including the build matrix, reproduce commands, and PR-by-PR history
-— live in [`remex/mojo/bench/RESULTS.md`](../remex/mojo/bench/RESULTS.md).
+— live in [`mojo/bench/RESULTS.md`](../mojo/bench/RESULTS.md).
 Headline numbers below.
 
 Since [#40](https://github.com/oaustegard/remex/issues/40), Mojo's
@@ -143,7 +143,7 @@ default `--seed S` path uses the same RNG stack as NumPy
 **byte-identical** to Python's `save_pq(Quantizer(d, bits, seed=S).encode(X))`
 at 1–4 bits. (`--rng xoshiro` opts back into the legacy
 xoshiro256++ + Marsaglia path; `--params` remains the canonical
-all-bit-widths bridge.) See `remex/mojo/README.md#two-parameter-modes`.
+all-bit-widths bridge.) See [`mojo/README.md#two-parameter-modes`](../mojo/README.md#two-parameter-modes).
 
 ### Wall-clock (n=10k, bits=4, queries=100, k=10, container CPU)
 
@@ -172,14 +172,14 @@ indicative pre-#51 measurements.
 
 - **Encode** crossed from 1.3x slower (initial port, scalar matvec, `_dot_f32` only) to 1.27x faster after [#37](https://github.com/oaustegard/remex/pull/37) (SIMD vectorization) + [#41](https://github.com/oaustegard/remex/issues/41) (NB=8 row-blocking through `_dot_block_8`). The float64-accumulator norm change in [#40](https://github.com/oaustegard/remex/issues/40) (needed for byte parity vs Python's `np.linalg.norm`) did not measurably regress encode speed — norm is a tiny fraction of the encode hot path.
 - **ADC search** wins consistently (4–7×) because Mojo's gather-then-scalar-add inner loop auto-vectorizes well; NumPy's equivalent is bottlenecked on per-chunk `np.outer` + `table[idx]` gathers.
-- **Twostage** was the weak spot before [#51](https://github.com/oaustegard/remex/pull/51): the O(n·candidates) selection-style coarse top-k loop made Mojo slower than NumPy at d ≤ 384 (0.20× at d=64). PR #51 replaced that with a min-heap walked once over `n` scores — O(n·k) → O(n log k), ~90× fewer comparisons at the default (n=10k, candidates=500). Mojo `search_twostage` is now consistently 5.5–6.7× faster than NumPy across all d, restoring it as the right default for memory-constrained workloads (single-stage `search`-cached speed at 4× less memory). The next bottleneck on the coarse pass is the per-row gather+arithmetic in ADC scoring, tracked by [#50](https://github.com/oaustegard/remex/issues/50) (~1.5–2× further estimated).
+- **Twostage** was the weak spot before [#51](https://github.com/oaustegard/remex/pull/51): the O(n·candidates) selection-style coarse top-k loop made Mojo slower than NumPy at d ≤ 384 (0.20× at d=64). PR #51 replaced that with a min-heap walked once over `n` scores — O(n·k) → O(n log k), ~90× fewer comparisons at the default (n=10k, candidates=500). Mojo `search_twostage` is now consistently 5.5–6.7× faster than NumPy across all d, restoring it as the right default for memory-constrained workloads (single-stage `search`-cached speed at 4× less memory). The next bottleneck on the coarse pass is the per-row gather+arithmetic in ADC scoring, addressed by PR [#52](https://github.com/oaustegard/remex/pull/52) (closing #50) (~1.5–2× further estimated).
 - **Encode advantage at d=768** shrinks to 1.12× — the matvec hits memory bandwidth limits, so Mojo and NumPy's BLAS converge.
 
 ### Reproduce
 
 ```bash
-cd remex/mojo
-mojo build -I . polarquant.mojo            -o polarquant
+cd mojo
+mojo build -I . remex.mojo                 -o remex
 mojo build -I . bench/bench_encode.mojo    -o bench/bench_encode
 mojo build -I . bench/bench_search.mojo    -o bench/bench_search
 mojo build -I . bench/bench_twostage.mojo  -o bench/bench_twostage
