@@ -13,6 +13,7 @@ remex/
 ├── __init__.py       # Public API, version
 ├── core.py           # Quantizer, CompressedVectors (main classes)
 ├── codebook.py       # Lloyd-Max codebooks + Matryoshka nested tables
+├── ivf.py            # IVFCoarseIndex — coarse-tier IVF, data-oblivious
 ├── packing.py        # Bit-packing for sub-byte storage (1-8 bit)
 ├── rotation.py       # Haar random orthogonal rotation via QR
 └── gpu.py            # Optional GPU backend (CuPy/PyTorch/NumPy)
@@ -21,6 +22,7 @@ tests/
 ├── test_polar_embed.py   # Core: rotation, codebook, quantizer, retrieval, packing
 ├── test_matryoshka.py    # Nested codebooks, precision parameter, two-stage search, subset
 ├── test_adc_gpu.py       # ADC search, memory accounting, GPUSearcher (numpy fallback)
+├── test_ivf.py           # IVFCoarseIndex: cell ID, multi-probe, recall, packed interop
 ├── test_packed_vectors.py # PackedVectors creation, unpacking, ADC, serialization
 └── test_coverage_gaps.py  # Edge cases, save/load all bits, subset search
 
@@ -52,6 +54,24 @@ Search:
 | `search()` | High (caches n*d*4 float32) | Fast (matmul) | Repeated queries, RAM available |
 | `search_adc()` | Low (uint8 indices only) | Slower (table lookup) | Memory-constrained, serverless |
 | `search_twostage()` | Low (ADC coarse + small fine) | Medium | Best recall/memory trade-off |
+
+### Sublinear coarse-tier scan: `IVFCoarseIndex`
+
+Optional inverted-file index over the coarse Matryoshka tier. Visits
+only `nprobe` of `2**n_bits` cells per query, replacing the
+bandwidth-bound flat coarse scan in `search_twostage` for very large
+corpora (≥ tens of millions of vectors). Two **data-oblivious** hash
+modes (no k-means, no fitting):
+
+- `mode='lsh'` — random-hyperplane SimHash, deterministic from
+  `(d, n_bits, seed)`.
+- `mode='rotated_prefix'` — sign of the first `n_bits` post-rotation
+  coordinates; free given the existing rotation matrix.
+
+Multi-probe is by Hamming distance from the query's hash. Setting
+`nprobe = 2**n_bits` recovers a flat scan exactly (verified by
+test_ivf.py). The latency-recall Pareto and cross-FoS bridge edge
+preservation are benchmarked in `bench/specter2_eval.py`.
 
 ## Development
 
