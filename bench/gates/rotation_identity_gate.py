@@ -55,6 +55,9 @@ _CANDIDATES = [
     os.environ.get("GATING_SKILL_DIR"),
     "/tmp/gating-skill/scripts",
     "/mnt/skills/user/gating/scripts",
+    # Vendored fallback (bench/gates/gate.py) so the gate runs in CI, where
+    # no skill directory is mounted. A real skill checkout still wins.
+    str(Path(__file__).resolve().parent),
 ]
 for _c in _CANDIDATES:
     if _c and (Path(_c) / "gate.py").is_file():
@@ -335,7 +338,9 @@ def main() -> int:
     g.coverage(
         "Does NOT cover the Arrow container. save_arrow/load_arrow carry a "
         "b'rotation' metadata key with the same absent-means-haar rule, but "
-        "pyarrow is an optional dependency and is skipped when absent."
+        "pyarrow is an optional dependency. The pytest-arrow CI job installs "
+        "it and fails if those tests skip, so the path is covered there — not "
+        "here, and not in a local run without the extra."
     )
     g.coverage(
         "Does NOT protect a pre-field READER from a future rht file. An old "
