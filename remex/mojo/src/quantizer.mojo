@@ -11,7 +11,7 @@ from std.memory import alloc, UnsafePointer
 from std.sys.info import simd_width_of
 from src.codebook import Codebook, NestedCodebook, lloyd_max_codebook
 from src.matrix import Matrix
-from src.rotation import haar_rotation, haar_rotation_numpy
+from src.rotation import haar_rotation, haar_rotation_numpy, rht_rotation
 from src.packing import pack, packed_nbytes
 
 
@@ -287,6 +287,19 @@ struct Quantizer(Movable):
         self.seed = seed
         self.R = haar_rotation_numpy(d, seed)
         self.cb = lloyd_max_codebook(d, bits)
+
+    @staticmethod
+    def from_rht_seed(d: Int, bits: Int, seed: UInt64) raises -> Quantizer:
+        """Randomized Hadamard rotation instead of Haar.
+
+        Bit-identical to Python `remex.Quantizer(d, bits, seed,
+        rotation="rht")` at float32. Builds in O(d^2 log d) rather than
+        the QR's O(d^3), which is the whole point at mainstream embedding
+        dimensions. Requires an even `d`.
+        """
+        var R = rht_rotation(d, seed)
+        var cb = lloyd_max_codebook(d, bits)
+        return Quantizer(R^, cb^, d, bits, seed)
 
     @staticmethod
     def from_xoshiro_seed(d: Int, bits: Int, seed: UInt64) raises -> Quantizer:

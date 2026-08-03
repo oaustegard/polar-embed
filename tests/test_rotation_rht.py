@@ -114,13 +114,28 @@ def test_rotation_is_part_of_the_encoding():
     assert cos(good) > 0.99 and cos(crossed) < 0.5, (cos(good), cos(crossed))
 
 
-def test_save_params_refuses_non_haar(tmp_path):
-    """Mojo regenerates the rotation from the seed and knows only Haar, so
-    emitting params for an RHT Quantizer would silently disagree."""
-    save_params(tmp_path / "ok.pr", Quantizer(d=64, bits=4, seed=1))
-    with pytest.raises(ValueError, match="rotation='haar'"):
-        save_params(tmp_path / "bad.pr",
-                    Quantizer(d=64, bits=4, seed=1, rotation="rht"))
+@pytest.mark.parametrize("rotation", ["haar", "rht"])
+def test_save_params_accepts_every_mojo_rotation(tmp_path, rotation):
+    """Mojo rebuilds both constructions from the seed, so params dump for
+    both. The R written is the Quantizer's own, whichever rotation built it."""
+    q = Quantizer(d=64, bits=4, seed=1, rotation=rotation)
+    path = tmp_path / f"{rotation}.pr"
+    save_params(path, q)
+
+    raw = path.read_bytes()
+    d, n_levels = 64, 1 << 4
+    assert len(raw) == 16 + d * d * 4 + (n_levels - 1) * 4 + n_levels * 4
+    R = np.frombuffer(raw, np.float32, count=d * d, offset=16).reshape(d, d)
+    assert np.array_equal(R, q.R)
+
+
+def test_save_params_refuses_a_rotation_mojo_lacks(tmp_path):
+    """The guard still has to bite for anything the Mojo port has no
+    construction for — it just no longer bites on 'rht'."""
+    q = Quantizer(d=64, bits=4, seed=1)
+    q.rotation = "hadamard-but-fancier"
+    with pytest.raises(ValueError, match="save_params supports rotation in"):
+        save_params(tmp_path / "bad.pr", q)
 
 
 def test_odd_dimension_rejected():

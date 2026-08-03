@@ -1,14 +1,19 @@
 """polarquant CLI — Mojo port of the remex compress/search workflow.
 
 Usage:
-    polarquant encode <input.npy> --bits N [--seed S | --params P.bin] -o <out.pq>
+    polarquant encode <input.npy> --bits N [--seed S | --params P.bin]
+                       [--rotation haar|rht] -o <out.pq>
     polarquant search <index.pq> <query.npy> --k K [--seed S | --params P.bin]
-                       [--top <int>]
+                       [--rotation haar|rht] [--top <int>]
 
 `--seed S`   computes (R, codebook) from seed S in Mojo (not bit-identical to
              a Python Quantizer with the same seed; see README).
 `--params P` loads (R, codebook) from a `.params` file written by
              `remex.save_params(quantizer, path)` — bit-identical encoding.
+`--rotation` picks the orthogonal rotation the seed path builds: `haar`
+             (default, Householder QR, O(d^3)) or `rht` (randomized
+             Hadamard, O(d^2 log d)). Must match the Python Quantizer's
+             `rotation=` argument or the codes will not agree.
 
 Outputs `index.pq`, the binary container readable by `remex.load_pq()`.
 """
@@ -22,7 +27,7 @@ from src.params_format import load_params
 from src.pq_format import save_pq, load_pq
 from src.quantizer import Quantizer, encode_batch, adc_search, search_twostage, decode_batch
 from src.packing import pack, packed_nbytes
-from src.rotation import haar_rotation, haar_rotation_numpy
+from src.rotation import haar_rotation, haar_rotation_numpy, rht_rotation
 from src.gpu.device import is_apple_gpu, is_gpu_available
 from src.gpu.encode import gpu_encode_batch
 from src.gpu.adc import gpu_adc_search
@@ -43,16 +48,29 @@ def _arg_idx(args: List[String], flag: String) -> Int:
 
 def _build_quantizer(d: Int, bits: Int, seed: UInt64,
                      params_path: String,
-                     rng_choice: String) raises -> Quantizer:
+                     rng_choice: String,
+                     rotation_choice: String) raises -> Quantizer:
     """Build a Quantizer from either a .params file or a seed.
 
-    Seed-based modes (default `numpy`) match Python `Quantizer(seed=S)` byte-for-byte.
-    `xoshiro` is the legacy fast self-contained Mojo path (no Python parity).
+    Seed-based modes (default `numpy` RNG, `haar` rotation) match Python
+    `Quantizer(seed=S, rotation=...)` byte-for-byte. `xoshiro` is the
+    legacy fast self-contained Mojo path (no Python parity).
     """
     if len(params_path) > 0:
         var R = Matrix(d, d)
         var cb = Codebook(bits)
         load_params(params_path, R, cb)
+        return Quantizer(R^, cb^, d, bits, seed)
+    if rotation_choice == "rht":
+        # The RHT is built from NumPy's PCG64 stream, so there is no
+        # xoshiro variant of it to offer.
+        if rng_choice != "numpy":
+            raise Error(
+                String("--rotation rht requires --rng numpy (the default); got --rng ")
+                + rng_choice
+            )
+        var R = rht_rotation(d, seed)
+        var cb = lloyd_max_codebook(d, bits)
         return Quantizer(R^, cb^, d, bits, seed)
     if rng_choice == "xoshiro":
         var R = haar_rotation(d, seed)
@@ -66,10 +84,14 @@ def _build_quantizer(d: Int, bits: Int, seed: UInt64,
 
 def _print_usage():
     print("usage:")
-    print("  polarquant encode <input.npy> --bits N (--seed S | --params P) [--device auto|cpu|gpu] -o <out.pq>")
-    print("  polarquant search <index.pq> <query.npy> --k K (--seed S | --params P) [--device auto|cpu|gpu] [--top T]")
+    print("  polarquant encode <input.npy> --bits N (--seed S | --params P) [--rotation haar|rht] [--device auto|cpu|gpu] -o <out.pq>")
+    print("  polarquant search <index.pq> <query.npy> --k K (--seed S | --params P) [--rotation haar|rht] [--device auto|cpu|gpu] [--top T]")
     print("                   [--twostage --candidates N --coarse-precision K]")
-    print("  polarquant decode <index.pq> (--seed S | --params P) [--precision P] -o <out.npy>")
+    print("  polarquant decode <index.pq> (--seed S | --params P) [--rotation haar|rht] [--precision P] -o <out.npy>")
+    print("")
+    print("--rotation defaults to 'haar' (Householder QR, O(d^3)). 'rht' is the randomized")
+    print("Hadamard transform, O(d^2 log d) to build and byte-identical to Python's")
+    print("Quantizer(..., rotation='rht'). It must match how the index was encoded.")
     print("")
     print("--device defaults to 'auto', which picks the most efficient backend per stage:")
     print("  encode: always CPU (GPU encode is currently slower on every measured platform;")
@@ -77,6 +99,17 @@ def _print_usage():
     print("  search: GPU if an accelerator is present, else CPU (GPU search is faster on")
     print("          Apple Metal via the corpus cache; non-Apple GPUs are not yet measured).")
     print("Use --device cpu or --device gpu to force a backend (e.g. for benchmarking).")
+
+
+def _parse_rotation(args: List[String]) raises -> String:
+    """Parse --rotation flag. Returns 'haar' (default) or 'rht'."""
+    var idx = _arg_idx(args, String("--rotation"))
+    if idx < 0:
+        return String("haar")
+    var rot = _arg_str(args, idx + 1)
+    if rot != String("haar") and rot != String("rht"):
+        raise Error(String("--rotation must be 'haar' or 'rht', got: ") + rot)
+    return rot
 
 
 def _parse_device(args: List[String]) raises -> String:
@@ -183,17 +216,18 @@ def cmd_encode(args: List[String]) raises:
         rng_choice = _arg_str(args, rng_idx + 1)
         if rng_choice != "numpy" and rng_choice != "xoshiro":
             raise Error("encode: --rng must be 'numpy' (default) or 'xoshiro'")
+    var rotation_choice = _parse_rotation(args)
 
     var device_note = String("")
     if requested_device == String("auto"):
         device_note = String(" [auto]")
-    print("encode:", input_path, "→", out_path, "(bits =", bits, ", device =", device + device_note, ", rng =", rng_choice, ")")
+    print("encode:", input_path, "→", out_path, "(bits =", bits, ", device =", device + device_note, ", rng =", rng_choice, ", rotation =", rotation_choice, ")")
     var X = load_npy_2d_f32(input_path)
     var n = X.rows
     var d = X.cols
     print("  loaded", n, "vectors of dimension", d)
 
-    var q = _build_quantizer(d, bits, seed, params_path, rng_choice)
+    var q = _build_quantizer(d, bits, seed, params_path, rng_choice, rotation_choice)
 
     # Copy X into a fresh buffer (works around an UnsafePointer borrow oddity
     # observed when passing struct fields across function boundaries).
@@ -296,8 +330,9 @@ def cmd_search(args: List[String]) raises:
         rng_choice2 = _arg_str(args, rng_idx2 + 1)
         if rng_choice2 != "numpy" and rng_choice2 != "xoshiro":
             raise Error("search: --rng must be 'numpy' (default) or 'xoshiro'")
+    var rotation_choice2 = _parse_rotation(args)
 
-    var q_quant = _build_quantizer(pq.d, pq.bits, seed, params_path, rng_choice2)
+    var q_quant = _build_quantizer(pq.d, pq.bits, seed, params_path, rng_choice2, rotation_choice2)
 
     # Unpack indices into uint8 (n*d). Copy norms into a fresh buffer too —
     # see test_encode.mojo for the same workaround.
@@ -373,6 +408,7 @@ def cmd_decode(args: List[String]) raises:
         rng_choice = _arg_str(args, rng_idx + 1)
         if rng_choice != "numpy" and rng_choice != "xoshiro":
             raise Error("decode: --rng must be 'numpy' (default) or 'xoshiro'")
+    var rotation_choice = _parse_rotation(args)
 
     var out_idx = _arg_idx(args, String("-o"))
     if out_idx < 0:
@@ -384,7 +420,7 @@ def cmd_decode(args: List[String]) raises:
           "(n =", pq.n, ", d =", pq.d, ", bits =", pq.bits,
           ", precision =", precision if precision > 0 else pq.bits, ")")
 
-    var q_quant = _build_quantizer(pq.d, pq.bits, seed, params_path, rng_choice)
+    var q_quant = _build_quantizer(pq.d, pq.bits, seed, params_path, rng_choice, rotation_choice)
 
     # Build nested centroid tables from the loaded codebook so they match
     # what Python would compute for the same Quantizer (mirrors the
