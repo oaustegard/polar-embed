@@ -100,18 +100,48 @@ def test_round_trip_fidelity_matches_haar(bits):
     assert abs(cos["haar"] - cos["rht"]) < 2e-3, cos
 
 
+def _mean_cos(X, A):
+    return float(np.mean(np.sum(X * A, 1) / (
+        np.linalg.norm(X, axis=1) * np.linalg.norm(A, axis=1))))
+
+
 def test_rotation_is_part_of_the_encoding():
-    """Codes from one rotation must not be decoded under the other. This is a
-    guard against treating `rotation` as a free-floating perf knob."""
+    """Crossing rotations is refused, not merely bad.
+
+    The codes carry the rotation that wrote them, and every decode/search
+    path checks it. This used to return wrong-but-plausible vectors.
+    """
     d, rng = 128, np.random.default_rng(1)
     X = rng.standard_normal((64, d)).astype(np.float32)
     qh = Quantizer(d=d, bits=8, seed=42, rotation="haar")
     qr = Quantizer(d=d, bits=8, seed=42, rotation="rht")
-    good = qh.decode(qh.encode(X))
-    crossed = qr.decode(qh.encode(X))
-    cos = lambda A: float(np.mean(np.sum(X * A, 1) / (
-        np.linalg.norm(X, axis=1) * np.linalg.norm(A, axis=1))))
-    assert cos(good) > 0.99 and cos(crossed) < 0.5, (cos(good), cos(crossed))
+    cv = qh.encode(X)
+
+    assert _mean_cos(X, qh.decode(cv)) > 0.99
+
+    for call in (lambda: qr.decode(cv),
+                 lambda: qr.search(cv, X[0], k=5),
+                 lambda: qr.search_adc(cv, X[0], k=5)):
+        with pytest.raises(ValueError, match="rotation mismatch"):
+            call()
+
+
+def test_crossing_rotations_is_worth_refusing():
+    """The refusal above has to be load-bearing, not fussiness.
+
+    Override the recorded rotation to bypass the check — the escape hatch a
+    caller with genuinely mislabelled legacy data would use — and measure
+    what the check is preventing.
+    """
+    d, rng = 128, np.random.default_rng(1)
+    X = rng.standard_normal((64, d)).astype(np.float32)
+    qh = Quantizer(d=d, bits=8, seed=42, rotation="haar")
+    qr = Quantizer(d=d, bits=8, seed=42, rotation="rht")
+
+    cv = qh.encode(X)
+    cv.rotation = "rht"          # lie about it, the way a bad default would
+    crossed = qr.decode(cv)
+    assert _mean_cos(X, crossed) < 0.5, _mean_cos(X, crossed)
 
 
 @pytest.mark.parametrize("rotation", ["haar", "rht"])
@@ -146,3 +176,92 @@ def test_odd_dimension_rejected():
 def test_unknown_rotation_rejected():
     with pytest.raises(ValueError, match="rotation must be one of"):
         Quantizer(d=64, bits=4, rotation="hadamard")
+
+
+# --- rotation is recorded wherever an index is persisted -------------------
+# The gate at bench/gates/rotation_identity_gate.py covers .pq and .npz under
+# a flipped library default. These cover the surfaces it states it does not:
+# Arrow metadata, the .params byte, and the from_rows entry point.
+
+@pytest.mark.parametrize("rotation", ["haar", "rht"])
+def test_pq_and_npz_round_trip_rotation(tmp_path, rotation):
+    from remex import load_pq, save_pq, CompressedVectors, PackedVectors
+
+    X = np.random.default_rng(0).standard_normal((24, 64)).astype(np.float32)
+    cv = Quantizer(d=64, bits=4, seed=1, rotation=rotation).encode(X)
+    assert cv.rotation == rotation
+
+    pq = tmp_path / "i.pq"
+    save_pq(pq, cv)
+    assert load_pq(pq).rotation == rotation
+
+    npz = tmp_path / "i.npz"
+    cv.save(npz)
+    assert CompressedVectors.load(npz).rotation == rotation
+
+    pv_path = tmp_path / "p.npz"
+    PackedVectors.from_compressed(cv).save(pv_path)
+    assert PackedVectors.load(pv_path).rotation == rotation
+
+
+def test_pq_rotation_byte_is_where_the_spec_says(tmp_path):
+    """Byte 17, and 0 must mean haar so pre-field files read correctly."""
+    from remex import save_pq
+
+    X = np.random.default_rng(0).standard_normal((8, 64)).astype(np.float32)
+    for rotation, expected in (("haar", 0), ("rht", 1)):
+        p = tmp_path / f"{rotation}.pq"
+        save_pq(p, Quantizer(d=64, bits=4, seed=1, rotation=rotation).encode(X))
+        assert p.read_bytes()[17] == expected
+
+
+def test_params_records_the_rotation_byte(tmp_path):
+    """.params byte 9 mirrors .pq byte 17, same 0-means-haar convention."""
+    for rotation, expected in (("haar", 0), ("rht", 1)):
+        p = tmp_path / f"{rotation}.pr"
+        save_params(p, Quantizer(d=32, bits=4, seed=1, rotation=rotation))
+        assert p.read_bytes()[9] == expected
+
+
+def test_from_rows_defaults_to_legacy_not_library_default():
+    """The DB schema has no rotation column, so the default must be the
+    frozen historical value — never whatever the library default is now."""
+    from remex import PackedVectors
+    from remex.rotation import LEGACY_ROTATION
+
+    X = np.random.default_rng(0).standard_normal((6, 64)).astype(np.float32)
+    pv = PackedVectors.from_compressed(
+        Quantizer(d=64, bits=4, seed=1, rotation="rht").encode(X)
+    )
+    rows = [bytes(r) for r in pv._packed]
+    rebuilt = PackedVectors.from_rows(rows, pv.norms, 64, 4)
+    assert rebuilt.rotation == LEGACY_ROTATION == "haar"
+    assert PackedVectors.from_rows(
+        rows, pv.norms, 64, 4, rotation="rht"
+    ).rotation == "rht"
+
+
+@pytest.mark.parametrize("rotation", ["haar", "rht"])
+def test_arrow_round_trips_rotation(tmp_path, rotation):
+    pytest.importorskip("pyarrow")
+    from remex import CompressedVectors, PackedVectors
+
+    X = np.random.default_rng(0).standard_normal((16, 64)).astype(np.float32)
+    cv = Quantizer(d=64, bits=4, seed=1, rotation=rotation).encode(X)
+    p = tmp_path / "i.arrow"
+    cv.save_arrow(p, seed=1)
+    assert CompressedVectors.load_arrow(p).rotation == rotation
+    assert PackedVectors.load_arrow(p).rotation == rotation
+
+
+def test_unknown_rotation_code_in_pq_is_rejected(tmp_path):
+    from remex import load_pq, save_pq
+
+    X = np.random.default_rng(0).standard_normal((8, 64)).astype(np.float32)
+    p = tmp_path / "i.pq"
+    save_pq(p, Quantizer(d=64, bits=4, seed=1).encode(X))
+    raw = bytearray(p.read_bytes())
+    raw[17] = 7                      # a rotation a future remex might add
+    p.write_bytes(bytes(raw))
+    with pytest.raises(ValueError, match="unknown rotation code"):
+        load_pq(p)

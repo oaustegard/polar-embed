@@ -4,7 +4,7 @@
 
 **remex** (formerly polar-embed) is a Python library for retrieval-validated embedding compression. It implements random orthogonal rotation + Lloyd-Max scalar quantization (from TurboQuant, Zandieh et al. ICLR 2026) to compress embedding vectors 2-16x with measured recall, optimized for nearest-neighbor retrieval in RAG systems.
 
-Key differentiator: **data-oblivious** — no training required. The quantizer is fully determined by `(dimension, bits, seed)`.
+Key differentiator: **data-oblivious** — no training required. The quantizer is fully determined by `(dimension, bits, seed, rotation)`.
 
 ## Architecture
 
@@ -98,7 +98,11 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
 ## Code conventions
 
 - **NumPy-only core**: No PyTorch/CuPy dependency in `remex/core.py`. GPU support is opt-in via `remex/gpu.py`.
-- **No training**: Fully data-oblivious. The quantizer is determined by `(d, bits, seed)` alone.
+- **No training**: Fully data-oblivious. The quantizer is determined by `(d, bits, seed, rotation)` alone.
+- **The rotation is part of the encoding**: every persisted container (`.pq` byte 17, `.npz` `rotation` key,
+  Arrow `b"rotation"` metadata) records which rotation wrote it, and an absent record means `"haar"` — the
+  frozen historical value, never the live default. That rule is what makes the default safe to change; see
+  `bench/gates/rotation_identity_gate.py`.
 - **Honest compression**: `nbytes` property uses bit-packed sizes, not uint8. Benchmark tables report packed compression ratios.
 - **Deterministic**: Same `(d, bits, seed)` must produce identical results across runs.
 - **Test thresholds**: Recall tests use conservative bounds (e.g. 2-bit R@10 >= 0.3, not exact values) because recall depends on random data.

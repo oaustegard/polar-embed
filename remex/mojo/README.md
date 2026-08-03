@@ -142,6 +142,19 @@ searched and decoded with it too.
 `--params` remains the canonical bridge for any case where you want
 guaranteed bit parity regardless of bit width or potential drift.
 
+### The index records its rotation
+
+`.pq` byte 17 holds the rotation code (`0` = haar, `1` = rht) and
+`.params` byte 9 mirrors it. Both were reserved-and-zero before the field
+existed, and haar is `0`, so every previously written file reads back as
+haar with no compatibility branch — which is the correct answer for all
+of them. `search` and `decode` refuse a `--rotation` that disagrees with
+what the index records, instead of silently decoding against the wrong
+rotation; the two constructions differ on roughly half their stored bits,
+so the results would look plausible and be wrong. `--params` skips the
+check, since the matrix comes from the file and there is nothing to
+disagree with.
+
 ### 8-bit byte-parity caveat
 
 At `--bits 8`, the Lloyd-Max codebook uses 256 levels and runs 300

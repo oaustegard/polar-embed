@@ -20,7 +20,7 @@ from remex import CompressedVectors
 loaded = CompressedVectors.load("index.npz")
 ```
 
-The quantizer is fully determined by `(d, bits, seed)` — no training, no fitting, no index to ship.
+The quantizer is fully determined by `(d, bits, seed, rotation)` — no training, no fitting, no index to ship. `rotation` defaults to `"haar"` and is part of the encoding exactly as `seed` is; every container records it, and decoding against the wrong one raises rather than returning wrong-but-plausible vectors.
 
 ## How it works
 

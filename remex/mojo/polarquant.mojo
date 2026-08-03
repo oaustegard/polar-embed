@@ -101,6 +101,39 @@ def _print_usage():
     print("Use --device cpu or --device gpu to force a backend (e.g. for benchmarking).")
 
 
+def _rotation_code(name: String) -> Int:
+    """Rotation name to its .pq / .params header code. Haar is 0 because
+    that byte was reserved-and-zero in every file written before the field
+    existed, so those files read back as haar without a presence check."""
+    if name == "rht":
+        return 1
+    return 0
+
+
+def _check_rotation_matches(stored: Int, requested: String,
+                            params_path: String) raises:
+    """Refuse to decode an index under a rotation that did not encode it.
+
+    Only meaningful on the --seed path: with --params the matrix comes out
+    of the file, so there is nothing to disagree with. Without this check a
+    mismatch is silent — the codes decode to plausible-looking vectors that
+    are simply wrong, because the two rotations differ in roughly half
+    their bits rather than slightly.
+    """
+    if len(params_path) > 0:
+        return
+    var want = _rotation_code(requested)
+    if stored != want:
+        var stored_name = String("rht") if stored == 1 else String("haar")
+        raise Error(
+            String("rotation mismatch: this index was encoded with '")
+            + stored_name + String("' but --rotation is '") + requested
+            + String("'. Re-run with --rotation ") + stored_name
+            + String(" (the codes would otherwise decode against the wrong ")
+            + String("rotation and the results would be silently wrong).")
+        )
+
+
 def _parse_rotation(args: List[String]) raises -> String:
     """Parse --rotation flag. Returns 'haar' (default) or 'rht'."""
     var idx = _arg_idx(args, String("--rotation"))
@@ -247,7 +280,8 @@ def cmd_encode(args: List[String]) raises:
     var nb = packed_nbytes(n * d, bits)
     var packed = alloc[UInt8](nb)
     pack(indices, n * d, bits, packed)
-    save_pq(out_path, packed, nb, norms, n, d, bits)
+    save_pq(out_path, packed, nb, norms, n, d, bits,
+            _rotation_code(rotation_choice))
     var total_bytes = nb + n * 4 + 32
     var ratio = Float64(n * d * 4) / Float64(nb + n * 4)
     print("  wrote", total_bytes, "bytes (compression ratio:", ratio, "x)")
@@ -332,6 +366,7 @@ def cmd_search(args: List[String]) raises:
             raise Error("search: --rng must be 'numpy' (default) or 'xoshiro'")
     var rotation_choice2 = _parse_rotation(args)
 
+    _check_rotation_matches(pq.rotation, rotation_choice2, params_path)
     var q_quant = _build_quantizer(pq.d, pq.bits, seed, params_path, rng_choice2, rotation_choice2)
 
     # Unpack indices into uint8 (n*d). Copy norms into a fresh buffer too —
@@ -420,6 +455,7 @@ def cmd_decode(args: List[String]) raises:
           "(n =", pq.n, ", d =", pq.d, ", bits =", pq.bits,
           ", precision =", precision if precision > 0 else pq.bits, ")")
 
+    _check_rotation_matches(pq.rotation, rotation_choice, params_path)
     var q_quant = _build_quantizer(pq.d, pq.bits, seed, params_path, rng_choice, rotation_choice)
 
     # Build nested centroid tables from the loaded codebook so they match

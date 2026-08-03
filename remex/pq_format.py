@@ -7,7 +7,8 @@ Layout (little-endian):
     bytes 4-7   : d (u32)
     bytes 8-15  : n (u64)
     byte 16     : bits (u8)
-    bytes 17-31 : reserved (15 zero bytes)
+    byte 17     : rotation code (u8) — 0 = haar, 1 = rht
+    bytes 18-31 : reserved (14 zero bytes)
     bytes 32+   : packed_indices (length = packed_nbytes(n*d, bits))
     then        : norms (n × float32, little-endian)
 
@@ -25,6 +26,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from remex.packing import pack, unpack, packed_nbytes
+from remex.rotation import (
+    ROTATION_CODES, rotation_from_code, validate_rotation,
+)
 
 if TYPE_CHECKING:
     from remex.core import CompressedVectors, Quantizer
@@ -82,6 +86,7 @@ def save_params(path: str | Path, quantizer: "Quantizer") -> None:
     header[0:4] = PARAMS_MAGIC
     header[4:8] = struct.pack("<I", d)
     header[8] = bits & 0xFF
+    header[9] = ROTATION_CODES[rotation]
     with open(path, "wb") as f:
         f.write(bytes(header))
         f.write(R.tobytes())
@@ -105,6 +110,7 @@ def save_pq(path: str | Path, compressed: "CompressedVectors") -> None:
     header[4:8] = struct.pack("<I", d)
     header[8:16] = struct.pack("<Q", n)
     header[16] = bits & 0xFF
+    header[17] = ROTATION_CODES[validate_rotation(compressed.rotation)]
 
     norms = np.ascontiguousarray(compressed.norms, dtype=np.float32)
 
@@ -129,6 +135,9 @@ def load_pq(path: str | Path) -> "CompressedVectors":
     (d,) = struct.unpack("<I", raw[4:8])
     (n,) = struct.unpack("<Q", raw[8:16])
     bits = raw[16]
+    # Byte 17 was reserved-and-zero before this field existed, and 0 is
+    # haar, so a pre-field file resolves to LEGACY_ROTATION for free.
+    rotation = rotation_from_code(raw[17])
     if bits in (5, 6, 7):
         raise ValueError(
             f"bits={bits} is not supported. Use 1-4 or 8 bits."
@@ -151,4 +160,4 @@ def load_pq(path: str | Path) -> "CompressedVectors":
     )
 
     indices = unpack(packed, bits, n * d).reshape(n, d)
-    return CompressedVectors(indices.copy(), norms.copy(), d, bits)
+    return CompressedVectors(indices.copy(), norms.copy(), d, bits, rotation)

@@ -4,7 +4,9 @@ import numpy as np
 from typing import Optional, Tuple, Iterable
 from remex.codebook import lloyd_max_codebook, nested_codebooks
 from remex.packing import pack, unpack, packed_nbytes
-from remex.rotation import haar_rotation, rht_rotation
+from remex.rotation import (
+    LEGACY_ROTATION, haar_rotation, rht_rotation, validate_rotation,
+)
 
 
 class CompressedVectors:
@@ -15,20 +17,22 @@ class CompressedVectors:
     computing the true compressed size (nbytes).
     """
 
-    __slots__ = ("indices", "norms", "d", "bits", "n", "_x_hat_rot")
+    __slots__ = ("indices", "norms", "d", "bits", "n", "rotation", "_x_hat_rot")
 
-    def __init__(self, indices: np.ndarray, norms: np.ndarray, d: int, bits: int):
+    def __init__(self, indices: np.ndarray, norms: np.ndarray, d: int, bits: int,
+                 rotation: str = LEGACY_ROTATION):
         self.indices = indices  # (n, d) uint8 — unpacked for fast access
         self.norms = norms
         self.d = d
         self.bits = bits
         self.n = indices.shape[0]
+        self.rotation = validate_rotation(rotation)
         self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
 
     def subset(self, idx: np.ndarray) -> "CompressedVectors":
         """Return a CompressedVectors containing only the given row indices."""
         sub = CompressedVectors(
-            self.indices[idx], self.norms[idx], self.d, self.bits
+            self.indices[idx], self.norms[idx], self.d, self.bits, self.rotation
         )
         if self._x_hat_rot is not None:
             sub._x_hat_rot = self._x_hat_rot[idx]
@@ -71,15 +75,22 @@ class CompressedVectors:
             d=np.int32(self.d),
             bits=np.int32(self.bits),
             n=np.int32(self.n),
+            rotation=np.str_(self.rotation),
         )
 
     @classmethod
     def load(cls, path: str) -> "CompressedVectors":
-        """Load from .npz file, unpacking bit-packed indices."""
+        """Load from .npz file, unpacking bit-packed indices.
+
+        A file with no ``rotation`` entry predates the field and is Haar —
+        see ``remex.rotation.LEGACY_ROTATION`` for why that is a frozen
+        constant rather than the current default.
+        """
         data = np.load(path)
         d = int(data["d"])
         bits = int(data["bits"])
         n = int(data["n"])
+        rotation = str(data["rotation"]) if "rotation" in data else LEGACY_ROTATION
 
         if "packed_indices" in data:
             flat = unpack(data["packed_indices"], bits, n * d)
@@ -88,7 +99,7 @@ class CompressedVectors:
             # Backward compat: old format stored unpacked indices
             indices = data["indices"]
 
-        return cls(indices, data["norms"], d, bits)
+        return cls(indices, data["norms"], d, bits, rotation)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format, packing indices for storage.
@@ -132,7 +143,8 @@ class PackedVectors:
     supported — use ``to_compressed()`` to convert back if needed.
     """
 
-    __slots__ = ("_packed", "norms", "d", "bits", "n", "_row_bytes", "_row_aligned")
+    __slots__ = ("_packed", "norms", "d", "bits", "n", "rotation",
+                 "_row_bytes", "_row_aligned")
 
     def __init__(
         self,
@@ -141,6 +153,7 @@ class PackedVectors:
         n: int,
         d: int,
         bits: int,
+        rotation: str = LEGACY_ROTATION,
     ):
         """
         Args:
@@ -149,12 +162,15 @@ class PackedVectors:
             n: Number of vectors.
             d: Vector dimension.
             bits: Bits per coordinate.
+            rotation: Which rotation encoded these codes. Defaults to
+                the frozen historical value, not the library default.
         """
         self._packed = packed  # (n, row_bytes) uint8
         self.norms = norms
         self.n = n
         self.d = d
         self.bits = bits
+        self.rotation = validate_rotation(rotation)
         self._row_bytes = packed_nbytes(1, d, bits)
         self._row_aligned = (d * bits) % 8 == 0
 
@@ -220,7 +236,8 @@ class PackedVectors:
             packed = np.empty((n, row_bytes), dtype=np.uint8)
             for i in range(n):
                 packed[i] = pack(compressed.indices[i], bits)
-        return cls(packed, compressed.norms.copy(), n, d, bits)
+        return cls(packed, compressed.norms.copy(), n, d, bits,
+                   compressed.rotation)
 
     @classmethod
     def from_rows(
@@ -229,6 +246,7 @@ class PackedVectors:
         norms: np.ndarray,
         d: int,
         bits: int,
+        rotation: str = LEGACY_ROTATION,
     ) -> "PackedVectors":
         """Reconstruct from database packed byte rows.
 
@@ -237,6 +255,10 @@ class PackedVectors:
             norms: (n,) float32 array of vector norms.
             d: Vector dimension.
             bits: Bits per coordinate.
+            rotation: Which rotation encoded these codes. The database
+                schema has no column for it, so the caller must supply it
+                for anything other than Haar — this default is the frozen
+                historical value, not the library default.
 
         Returns:
             PackedVectors instance.
@@ -249,7 +271,8 @@ class PackedVectors:
                 row_list.append(np.asarray(r, dtype=np.uint8))
         packed = np.stack(row_list)
         n = len(row_list)
-        return cls(packed, np.asarray(norms, dtype=np.float32), n, d, bits)
+        return cls(packed, np.asarray(norms, dtype=np.float32), n, d, bits,
+                   rotation)
 
     def at_precision(self, target_bits: int) -> "PackedVectors":
         """Derive a lower-bit representation via Matryoshka right-shift.
@@ -289,13 +312,16 @@ class PackedVectors:
                     packed_target[start + i] = pack(shifted[i], target_bits)
 
         return PackedVectors(
-            packed_target, self.norms.copy(), self.n, self.d, target_bits
+            packed_target, self.norms.copy(), self.n, self.d, target_bits,
+            self.rotation,
         )
 
     def to_compressed(self) -> CompressedVectors:
         """Convert to CompressedVectors by unpacking all indices."""
         indices = self.unpack_rows(0, self.n)
-        return CompressedVectors(indices, self.norms.copy(), self.d, self.bits)
+        return CompressedVectors(
+            indices, self.norms.copy(), self.d, self.bits, self.rotation
+        )
 
     def subset(self, idx: np.ndarray) -> "PackedVectors":
         """Return a PackedVectors containing only the given row indices."""
@@ -306,6 +332,7 @@ class PackedVectors:
             len(idx),
             self.d,
             self.bits,
+            self.rotation,
         )
 
     @property
@@ -332,19 +359,24 @@ class PackedVectors:
             d=np.int32(self.d),
             bits=np.int32(self.bits),
             n=np.int32(self.n),
+            rotation=np.str_(self.rotation),
         )
 
     @classmethod
     def load(cls, path: str) -> "PackedVectors":
-        """Load from .npz file, keeping indices packed."""
+        """Load from .npz file, keeping indices packed.
+
+        A file with no ``rotation`` entry predates the field and is Haar.
+        """
         data = np.load(path)
         d = int(data["d"])
         bits = int(data["bits"])
         n = int(data["n"])
+        rotation = str(data["rotation"]) if "rotation" in data else LEGACY_ROTATION
         row_bytes = packed_nbytes(1, d, bits)
         packed_flat = data["packed_indices"]
         packed = packed_flat.reshape(n, row_bytes)
-        return cls(packed, data["norms"], n, d, bits)
+        return cls(packed, data["norms"], n, d, bits, rotation)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format.
@@ -373,6 +405,7 @@ class PackedVectors:
             b"d": str(self.d).encode(),
             b"bits": str(self.bits).encode(),
             b"n": str(self.n).encode(),
+            b"rotation": self.rotation.encode(),
         }
         if seed is not None:
             metadata[b"seed"] = str(seed).encode()
@@ -424,6 +457,11 @@ class PackedVectors:
         d = int(metadata[b"d"])
         bits = int(metadata[b"bits"])
         n = int(metadata[b"n"])
+        rotation = (
+            metadata[b"rotation"].decode()
+            if b"rotation" in metadata
+            else LEGACY_ROTATION
+        )
         row_bytes = packed_nbytes(1, d, bits)
 
         norms = table.column("norms").to_numpy().astype(np.float32)
@@ -436,7 +474,7 @@ class PackedVectors:
         packed_flat = np.frombuffer(data_buf, dtype=np.uint8)[: n * row_bytes]
         packed = packed_flat.reshape(n, row_bytes).copy()
 
-        return cls(packed, norms, n, d, bits)
+        return cls(packed, norms, n, d, bits, rotation)
 
 
 class Quantizer:
@@ -536,7 +574,29 @@ class Quantizer:
 
         indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
 
-        return CompressedVectors(indices, norms, self.d, self.bits)
+        return CompressedVectors(indices, norms, self.d, self.bits, self.rotation)
+
+    def _check_rotation(self, compressed) -> None:
+        """Refuse to interpret codes a different rotation encoded.
+
+        The rotation is part of the encoding exactly as `seed` is, and the
+        two constructions disagree on ~50% of stored bits — so a mismatch
+        is not a small error, it is noise that still looks like an answer.
+        Recording the rotation on disk is what makes this check possible;
+        this is what makes it protective. If you are knowingly reading a
+        legacy container whose recorded value is wrong, set
+        ``compressed.rotation`` before calling.
+        """
+        stored = getattr(compressed, "rotation", LEGACY_ROTATION)
+        if stored != self.rotation:
+            raise ValueError(
+                f"rotation mismatch: these codes were encoded with "
+                f"{stored!r} but this Quantizer uses {self.rotation!r}. "
+                f"Rebuild the Quantizer with rotation={stored!r}. "
+                f"(Decoding across rotations returns plausible-looking "
+                f"vectors that are wrong — the two disagree on about half "
+                f"of all stored bits.)"
+            )
 
     def decode(
         self, compressed: CompressedVectors, precision: Optional[int] = None
@@ -594,6 +654,7 @@ class Quantizer:
                 "Use search_adc() or search_twostage(), or convert "
                 "with packed.to_compressed() first."
             )
+        self._check_rotation(compressed)
         query = np.asarray(query, dtype=np.float32)
         q_rot = self.R @ query
 
@@ -910,7 +971,12 @@ class Quantizer:
     def _resolve_centroids(
         self, compressed: CompressedVectors, precision: Optional[int]
     ) -> np.ndarray:
-        """Get centroid table for the requested precision level."""
+        """Get centroid table for the requested precision level.
+
+        Every decode/search path passes through here, which makes it the
+        one place the rotation invariant has to hold.
+        """
+        self._check_rotation(compressed)
         if precision is None:
             return self.centroids
         if precision < 1 or precision > self.bits:
