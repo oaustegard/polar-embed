@@ -43,6 +43,23 @@ def save_params(path: str | Path, quantizer: "Quantizer") -> None:
 
     Used to verify bit-identical encode output between Python and Mojo.
     """
+    # The Mojo side REGENERATES the rotation from the seed
+    # (mojo/src/quantizer.mojo builds haar_rotation_numpy(d, seed)); it does
+    # not read the R written below. So these parameters only mirror a
+    # Quantizer whose rotation Mojo can reproduce, and the whole point of this
+    # file is verifying bit-identical encode output. Emitting it for any other
+    # rotation would hand the caller parameters that silently disagree.
+    rotation = getattr(quantizer, "rotation", "haar")
+    if rotation != "haar":
+        raise ValueError(
+            f"save_params only supports rotation='haar', got {rotation!r}. "
+            f"The Mojo port regenerates the rotation from the seed and knows "
+            f"only the Haar construction, so it would encode against a "
+            f"different rotation than this Quantizer and the codes would not "
+            f"match. Rebuild with rotation='haar' to produce Mojo-mirrorable "
+            f"parameters."
+        )
+
     d = int(quantizer.d)
     bits = int(quantizer.bits)
     R = np.ascontiguousarray(quantizer.R, dtype=np.float32)

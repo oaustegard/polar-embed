@@ -4,7 +4,7 @@ import numpy as np
 from typing import Optional, Tuple, Iterable
 from remex.codebook import lloyd_max_codebook, nested_codebooks
 from remex.packing import pack, unpack, packed_nbytes
-from remex.rotation import haar_rotation
+from remex.rotation import haar_rotation, rht_rotation
 
 
 class CompressedVectors:
@@ -460,9 +460,31 @@ class Quantizer:
         d: Vector dimension.
         bits: Bits per coordinate (1-8). 3-4 is the sweet spot.
         seed: Random seed for rotation matrix.
+        rotation: Which orthogonal rotation to use.
+
+            "haar" (default) — Haar-distributed, via explicit Householder QR.
+                Bit-reproducible against the Mojo port (#40). O(d^3) to build:
+                measured 1.8 s at d=768, 11.4 s at d=1536, 150 s at d=3072.
+
+            "rht" — randomized Hadamard, O(d^2 log d) to build: 0.4 s at
+                d=768, 5.7 s at d=3072 (26x faster). Measured
+                indistinguishable from Haar on retrieval recall
+                (-0.0001 +/- 0.0013 pooled over 3 corpora x 6 bit widths x
+                5 seeds, oaustegard/experiments#11). The Mojo port cannot
+                reproduce it, so `save_params` refuses a Quantizer built this
+                way rather than emitting parameters that silently disagree.
+                Requires an even d.
+
+            Both are seed-deterministic and exactly orthogonal. The rotation
+            is part of the encoding: vectors encoded under one CANNOT be
+            decoded under the other, so it must match across encode/decode
+            exactly as `seed` must.
     """
 
-    def __init__(self, d: int, bits: int = 4, seed: int = 42):
+    ROTATIONS = {"haar": haar_rotation, "rht": rht_rotation}
+
+    def __init__(self, d: int, bits: int = 4, seed: int = 42,
+                 rotation: str = "haar"):
         if bits < 1 or bits > 8:
             raise ValueError(f"bits must be 1-4 or 8, got {bits}")
         if bits in (5, 6, 7):
@@ -471,11 +493,18 @@ class Quantizer:
                 f"5-7 bit widths offer negligible benefit over 4-bit or 8-bit."
             )
 
+        if rotation not in self.ROTATIONS:
+            raise ValueError(
+                f"rotation must be one of {sorted(self.ROTATIONS)}, "
+                f"got {rotation!r}"
+            )
+
         self.d = d
         self.bits = bits
         self.seed = seed
+        self.rotation = rotation
 
-        self.R = haar_rotation(d, seed)
+        self.R = self.ROTATIONS[rotation](d, seed)
         self.boundaries, self.centroids = lloyd_max_codebook(d, bits)
 
         # Precompute nested centroid tables for all bit levels <= bits
