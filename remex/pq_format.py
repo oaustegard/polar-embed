@@ -38,26 +38,32 @@ PARAMS_VERSION = 1
 PARAMS_MAGIC = b"PR\x00\x01"
 
 
+# Rotations the Mojo port can rebuild from `(d, seed)` alone, mapped to the
+# `polarquant` flag that selects each one. `--params` reads R straight out of
+# the file and is rotation-agnostic, but a caller dumping params is usually
+# also exercising the seed path, and a rotation Mojo has never heard of would
+# fail there without saying why. Keep in step with
+# `remex/mojo/src/rotation.mojo`.
+MOJO_ROTATIONS = {"haar": "--rotation haar", "rht": "--rotation rht"}
+
+
 def save_params(path: str | Path, quantizer: "Quantizer") -> None:
     """Dump (R, boundaries, centroids) so a Mojo binary can mirror this Quantizer.
 
     Used to verify bit-identical encode output between Python and Mojo.
+
+    The Mojo CLI consumes this two ways. ``--params P`` loads R from the file
+    and works for any rotation. ``--seed S --rotation K`` rebuilds R in Mojo
+    from the seed instead; that path needs a construction Mojo actually
+    implements, which is what the check below is for.
     """
-    # The Mojo side REGENERATES the rotation from the seed
-    # (mojo/src/quantizer.mojo builds haar_rotation_numpy(d, seed)); it does
-    # not read the R written below. So these parameters only mirror a
-    # Quantizer whose rotation Mojo can reproduce, and the whole point of this
-    # file is verifying bit-identical encode output. Emitting it for any other
-    # rotation would hand the caller parameters that silently disagree.
     rotation = getattr(quantizer, "rotation", "haar")
-    if rotation != "haar":
+    if rotation not in MOJO_ROTATIONS:
         raise ValueError(
-            f"save_params only supports rotation='haar', got {rotation!r}. "
-            f"The Mojo port regenerates the rotation from the seed and knows "
-            f"only the Haar construction, so it would encode against a "
-            f"different rotation than this Quantizer and the codes would not "
-            f"match. Rebuild with rotation='haar' to produce Mojo-mirrorable "
-            f"parameters."
+            f"save_params supports rotation in {sorted(MOJO_ROTATIONS)}, got "
+            f"{rotation!r}. The Mojo port has no construction for it, so "
+            f"`polarquant --seed` would encode against a different rotation "
+            f"than this Quantizer and the codes would not match."
         )
 
     d = int(quantizer.d)

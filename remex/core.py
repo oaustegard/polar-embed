@@ -470,10 +470,9 @@ class Quantizer:
                 d=768, 5.7 s at d=3072 (26x faster). Measured
                 indistinguishable from Haar on retrieval recall
                 (-0.0001 +/- 0.0013 pooled over 3 corpora x 6 bit widths x
-                5 seeds, oaustegard/experiments#11). The Mojo port cannot
-                reproduce it, so `save_params` refuses a Quantizer built this
-                way rather than emitting parameters that silently disagree.
-                Requires an even d.
+                5 seeds, oaustegard/experiments#11). Bit-reproducible against
+                the Mojo port via `polarquant --rotation rht`. Requires an
+                even d.
 
             Both are seed-deterministic and exactly orthogonal. The rotation
             is part of the encoding: vectors encoded under one CANNOT be

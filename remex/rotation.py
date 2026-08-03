@@ -133,11 +133,11 @@ def rht_rotation(d: int, seed: int = 42) -> np.ndarray:
     option here.  Materialized by applying the transform to the identity, one
     batched pass.
 
-    NOTE: the Mojo port regenerates the rotation from the seed
-    (``mojo/src/quantizer.mojo``), and only knows the Haar construction.  A
-    Quantizer built with this rotation therefore cannot be mirrored by the
-    Mojo binary; ``pq_format.save_params`` refuses it rather than writing
-    parameters that would silently disagree.
+    The Mojo port implements the same construction, off the same NumPy PCG64
+    stream (``mojo/src/rotation.mojo::rht_rotation``), so ``polarquant
+    --seed S --rotation rht`` rebuilds this matrix byte-for-byte and encodes
+    identically.  ``--params`` works too, and reads R straight out of the
+    file.
 
     Args:
         d: Matrix dimension.

@@ -152,12 +152,22 @@ struct PCG64(Copyable, Movable):
 
     State / inc are 128-bit. Output is XSL-RR: rotate-right of (low^high)
     by (high >> 58) bits. One step per output uint64.
+
+    `has_uint32` / `uinteger` mirror the same fields in NumPy's
+    `pcg64_state`: a 32-bit request draws one uint64 and buffers its high
+    half for the next request. Consumers that draw 64-bit words
+    (`next_u64`, `next_double`, the Ziggurat) never touch that buffer, so
+    the two streams interleave exactly as they do in NumPy.
     """
     var state: UInt128
     var inc: UInt128
+    var has_uint32: Bool
+    var uinteger: UInt32
 
     fn __init__(out self, seed: UInt64):
         """Initialize from an integer seed via SeedSequence."""
+        self.has_uint32 = False
+        self.uinteger = UInt32(0)
         var pool = seedseq_pool_from_u64(seed)
         var sw = alloc[UInt64](4)
         seedseq_generate_state_u64(pool, 4, sw)
@@ -190,6 +200,60 @@ struct PCG64(Copyable, Movable):
         # Standard NumPy convention: top 53 bits / 2^53.
         var u = self.next_u64()
         return Float64(u >> UInt64(11)) * (Float64(1.0) / Float64(1 << 53))
+
+    fn next_u32(mut self) -> UInt32:
+        """`pcg64_next32`: low half now, high half buffered for next call."""
+        if self.has_uint32:
+            self.has_uint32 = False
+            return self.uinteger
+        var nxt = self.next_u64()
+        self.has_uint32 = True
+        self.uinteger = UInt32((nxt >> UInt64(32)) & UInt64(0xFFFFFFFF))
+        return UInt32(nxt & UInt64(0xFFFFFFFF))
+
+    fn random_interval(mut self, max_: UInt64) -> UInt64:
+        """`random_interval`: uniform on [0, max_] by masked rejection.
+
+        This is what `Generator.shuffle` draws with — NOT the Lemire path
+        `Generator.integers` uses. Getting the two mixed up desynchronizes
+        the stream, so keep them separate.
+        """
+        if max_ == UInt64(0):
+            return UInt64(0)
+        var mask = max_
+        mask |= mask >> UInt64(1)
+        mask |= mask >> UInt64(2)
+        mask |= mask >> UInt64(4)
+        mask |= mask >> UInt64(8)
+        mask |= mask >> UInt64(16)
+        mask |= mask >> UInt64(32)
+        if max_ <= UInt64(0xFFFFFFFF):
+            var mask32 = UInt32(mask & UInt64(0xFFFFFFFF))
+            while True:
+                var v32 = self.next_u32() & mask32
+                if UInt64(v32) <= max_:
+                    return UInt64(v32)
+        while True:
+            var v = self.next_u64() & mask
+            if v <= max_:
+                return v
+
+    fn bounded_lemire_u32(mut self, rng: UInt32) -> UInt32:
+        """`bounded_lemire_uint32`: uniform on [0, rng], Lemire's method.
+
+        This is what `Generator.integers(0, rng + 1)` draws with. `rng`
+        must not be 0xFFFFFFFF (`rng_excl` would wrap to zero) — the only
+        caller here passes 1.
+        """
+        var rng_excl = UInt64(rng) + UInt64(1)
+        var m = UInt64(self.next_u32()) * rng_excl
+        var leftover = m & UInt64(0xFFFFFFFF)
+        if leftover < rng_excl:
+            var threshold = (UInt64(0xFFFFFFFF) - UInt64(rng)) % rng_excl
+            while leftover < threshold:
+                m = UInt64(self.next_u32()) * rng_excl
+                leftover = m & UInt64(0xFFFFFFFF)
+        return UInt32(m >> UInt64(32))
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ remex/mojo/
 │   ├── mathx.mojo           # erf-based normal CDF / PDF
 │   ├── rng.mojo             # xoshiro256++ + Marsaglia polar normal
 │   ├── matrix.mojo          # Owning Float32 / Float64 matrices
-│   ├── rotation.mojo        # Householder QR → Haar orthogonal matrix
+│   ├── rotation.mojo        # Householder QR → Haar, and randomized Hadamard (RHT)
 │   ├── codebook.mojo        # Lloyd-Max iteration on N(0, 1/d) + Matryoshka nested tables
 │   ├── packing.mojo         # 1/2/3/4/8-bit pack and unpack
 │   ├── packed_vectors.mojo  # Bit-packed in-memory storage with on-demand unpack
@@ -33,6 +33,9 @@ remex/mojo/
 ├── tests/
 │   ├── test_rng.mojo
 │   ├── test_rotation.mojo
+│   ├── test_rht.mojo               # RHT byte parity vs Python + orthogonality
+│   ├── test_rht_encode.mojo        # RHT encode parity, --seed and --params routes
+│   ├── build_rht_fixture.py        # Python fixture builder for the two above
 │   ├── test_codebook.mojo
 │   ├── test_packing.mojo
 │   ├── test_packed_vectors.mojo    # PackedVectors round-trip + at_precision parity
@@ -79,6 +82,10 @@ mojo build -I . bench/bench_ivf.mojo       -o bench/bench_ivf
 # Encode an .npy of float32 vectors → .pq
 ./polarquant encode corpus.npy --bits 4 --seed 42 -o corpus.pq
 
+# Same, with the randomized Hadamard rotation (cheaper to build at large d).
+# --rotation is part of the encoding: pass the same value to search/decode.
+./polarquant encode corpus.npy --bits 4 --seed 42 --rotation rht -o corpus.pq
+
 # Search a single (1, d) query against a .pq, top-k
 ./polarquant search corpus.pq query.npy --k 10 --seed 42 --top 10
 
@@ -106,11 +113,12 @@ print(cv.n, cv.d, cv.bits, cv.compression_ratio)
 The encode/search path needs (R, boundaries, centroids). The CLI
 provides those two ways:
 
-| Flag | Source of (R, codebook) | Bit-identical to a Python `Quantizer(seed=S)`? |
+| Flag | Source of (R, codebook) | Bit-identical to the matching Python `Quantizer`? |
 |---|---|---|
-| `--seed S` *(default RNG: numpy)* | Computed in Mojo from S via PCG64 + SeedSequence + Ziggurat + Householder QR + Lloyd-Max | **Yes**, at 1–4 bits. **8-bit:** see caveat below. |
+| `--seed S` *(default RNG: numpy, rotation: haar)* | Computed in Mojo from S via PCG64 + SeedSequence + Ziggurat + Householder QR + Lloyd-Max | **Yes**, at 1–4 bits. **8-bit:** see caveat below. |
+| `--seed S --rotation rht` | Computed in Mojo from S via PCG64 + SeedSequence + permute/sign/FWHT + Lloyd-Max | **Yes**, vs `Quantizer(..., rotation="rht")`, same bit-width caveat. |
 | `--seed S --rng xoshiro` | Computed in Mojo from S via xoshiro256++ + Marsaglia + Householder QR + Lloyd-Max | **No.** Both Haar samples but from different Gaussian streams. Faster init, no Ziggurat tables. |
-| `--params P.bin` | Loaded from a file written by `remex.save_params(quantizer, P)` | **Yes**, at all bit widths. |
+| `--params P.bin` | Loaded from a file written by `remex.save_params(quantizer, P)` | **Yes**, at all bit widths and for either rotation. |
 
 `--seed` (numpy mode, the default) gives a self-contained Mojo workflow
 with end-to-end byte parity vs Python: `polarquant encode X.npy --bits 4
@@ -121,6 +129,15 @@ issue #40 and uses the new `src/rng_numpy.mojo` module.
 `--seed --rng xoshiro` is the legacy fast path. Use it when you don't
 need Python parity — startup is slightly faster (no 25 KB of Ziggurat
 tables to populate).
+
+`--rotation rht` builds the randomized Hadamard transform instead of the
+Haar matrix — `O(d^2 log d)` instead of the QR's `O(d^3)`, off the same
+NumPy PCG64 stream Python uses, so `polarquant encode --seed 42
+--rotation rht` and `Quantizer(d, bits, seed=42, rotation="rht")` agree
+byte for byte. It needs an even `d`, and it only combines with the numpy
+RNG (there is no xoshiro variant of the construction). The rotation is
+part of the encoding: an index encoded with `--rotation rht` must be
+searched and decoded with it too.
 
 `--params` remains the canonical bridge for any case where you want
 guaranteed bit parity regardless of bit width or potential drift.
@@ -146,6 +163,9 @@ cd remex/mojo
 mojo run -I . tests/test_rng.mojo
 mojo run -I . tests/test_rng_numpy.mojo   # NumPy-bit-identical RNG (issue #40)
 mojo run -I . tests/test_rotation.mojo
+python3 tests/build_rht_fixture.py    # fixtures for the two RHT tests
+mojo run -I . tests/test_rht.mojo         # RHT byte parity vs Python
+mojo run -I . tests/test_rht_encode.mojo  # RHT encode parity, both routes
 mojo run -I . tests/test_codebook.mojo
 mojo run -I . tests/test_packing.mojo
 
