@@ -6,7 +6,8 @@ Layout (little-endian):
   bytes 0-3   : magic 'PR\x00\x01'
   bytes 4-7   : d (u32)
   byte 8      : bits (u8)
-  bytes 9-15  : reserved (zero)
+  byte 9      : rotation code (u8) — 0 = haar, 1 = rht
+  bytes 10-15 : reserved (zero)
   bytes 16+   : R              (d * d float32 row-major)
   then        : boundaries     ((n_levels - 1) float32)
   then        : centroids      (n_levels float32)
@@ -88,7 +89,8 @@ def load_params(path: String, mut R_out: Matrix, mut cb_out: Codebook) raises:
     owned.free()
 
 
-def save_params(path: String, R: Matrix, cb: Codebook) raises:
+def save_params(path: String, R: Matrix, cb: Codebook,
+                rotation: Int = 0) raises:
     """Write (R, boundaries, centroids) to a .params file."""
     var d = R.rows
     var bits = cb.bits
@@ -109,6 +111,7 @@ def save_params(path: String, R: Matrix, cb: Codebook) raises:
     buf[6] = UInt8((d >> 16) & 0xFF)
     buf[7] = UInt8((d >> 24) & 0xFF)
     buf[8] = UInt8(bits)
+    buf[9] = UInt8(rotation)
 
     var R_src = R.data.bitcast[UInt8]()
     for i in range(R_bytes):

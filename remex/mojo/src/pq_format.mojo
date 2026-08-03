@@ -7,7 +7,8 @@ Layout (all little-endian):
   bytes 4-7   : d (u32)
   bytes 8-15  : n (u64)
   byte 16     : bits (u8)
-  bytes 17-31 : reserved (15 zero bytes) — header padded to 32 bytes
+  byte 17     : rotation code (u8) — 0 = haar, 1 = rht
+  bytes 18-31 : reserved (14 zero bytes) — header padded to 32 bytes
   bytes 32+   : packed_indices (length = packed_nbytes(n*d, bits))
   then        : norms (n × float32)
 
@@ -30,12 +31,21 @@ struct PqVectors(Movable):
     var n: Int
     var d: Int
     var bits: Int
+    var rotation: Int
+    """Rotation code the file records: 0 = haar, 1 = rht.
+
+    Byte 17 was reserved-and-zero before this field existed and haar is
+    0, so a file written by an older remex reads back as haar with no
+    presence check — which is the correct answer for every such file.
+    """
     var packed_bytes: Int
 
-    def __init__(out self, n: Int, d: Int, bits: Int) raises:
+    def __init__(out self, n: Int, d: Int, bits: Int,
+                 rotation: Int = 0) raises:
         self.n = n
         self.d = d
         self.bits = bits
+        self.rotation = rotation
         self.packed_bytes = packed_nbytes(n * d, bits)
         self.packed_indices = alloc[UInt8](self.packed_bytes)
         self.norms = alloc[Float32](n)
@@ -64,7 +74,7 @@ def _u64_le(buf: UnsafePointer[UInt8, MutExternalOrigin], off: Int) -> Int:
 def save_pq(path: String,
             packed_indices: UnsafePointer[UInt8, MutExternalOrigin], packed_bytes: Int,
             norms: UnsafePointer[Float32, MutExternalOrigin], n: Int,
-            d: Int, bits: Int) raises:
+            d: Int, bits: Int, rotation: Int = 0) raises:
     """Write a .pq file."""
     var total = PQ_HEADER_BYTES + packed_bytes + n * 4
     var buf = alloc[UInt8](total)
@@ -83,8 +93,9 @@ def save_pq(path: String,
     # n (u64 LE) at offset 8
     for k in range(8):
         buf[8 + k] = UInt8((n >> (8 * k)) & 0xFF)
-    # bits at offset 16
+    # bits at offset 16, rotation code at 17
     buf[16] = UInt8(bits)
+    buf[17] = UInt8(rotation)
 
     # packed indices
     for i in range(packed_bytes):
@@ -120,8 +131,15 @@ def load_pq(path: String) raises -> PqVectors:
     var d = _u32_le(owned, 4)
     var n = _u64_le(owned, 8)
     var bits = Int(owned[16])
+    var rotation = Int(owned[17])
+    if rotation > 1:
+        owned.free()
+        raise Error(
+            String("unknown rotation code ") + String(rotation)
+            + String(" in .pq header; this file was written by a newer remex")
+        )
 
-    var pq = PqVectors(n, d, bits)
+    var pq = PqVectors(n, d, bits, rotation)
     var expected = PQ_HEADER_BYTES + pq.packed_bytes + n * 4
     if len(raw) < expected:
         owned.free()

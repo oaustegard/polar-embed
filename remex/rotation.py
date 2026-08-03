@@ -12,6 +12,45 @@ import math
 
 import numpy as np
 
+#: What an *absent* rotation record on disk means.
+#:
+#: A frozen historical constant, deliberately NOT tied to ``Quantizer``'s
+#: live ``rotation`` default. Every index written before this field existed
+#: was built with Haar, and must keep decoding as Haar no matter what the
+#: default becomes later. Binding this to the default would mean flipping
+#: the default silently re-decodes every stored index under a rotation that
+#: did not encode it — and the codes are 50%-different, not slightly off,
+#: so the failure is total and silent rather than noisy.
+LEGACY_ROTATION = "haar"
+
+#: Rotation name to its on-disk code, for the byte-oriented ``.pq`` and
+#: ``.params`` headers. Haar is 0 because the reserved header bytes this
+#: lives in were already zero-filled in every file written before the field
+#: existed — so an old file decodes to ``LEGACY_ROTATION`` for free, with no
+#: "is the field present?" branch.
+ROTATION_CODES = {"haar": 0, "rht": 1}
+ROTATION_BY_CODE = {code: name for name, code in ROTATION_CODES.items()}
+
+
+def validate_rotation(kind: str) -> str:
+    """Return ``kind`` if it names a rotation this library can build."""
+    if kind not in ROTATION_CODES:
+        raise ValueError(
+            f"unknown rotation {kind!r}; expected one of "
+            f"{sorted(ROTATION_CODES)}."
+        )
+    return kind
+
+
+def rotation_from_code(code: int) -> str:
+    """Map an on-disk rotation byte back to its name."""
+    if code not in ROTATION_BY_CODE:
+        raise ValueError(
+            f"unknown rotation code {code} in header; this file was written "
+            f"by a newer remex. Known codes: {sorted(ROTATION_BY_CODE)}."
+        )
+    return ROTATION_BY_CODE[code]
+
 
 def _householder_qr(A: np.ndarray) -> np.ndarray:
     """In-place Householder QR; returns Q. After the call A holds R.
