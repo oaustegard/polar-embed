@@ -26,7 +26,25 @@ The quantizer is fully determined by `(d, bits, seed, rotation)` — no training
 
 Three steps, each with a clear purpose:
 
-1. **Random rotation** — A fixed orthogonal matrix ([Haar-distributed](https://arxiv.org/abs/math-ph/0609050) via QR decomposition) transforms any embedding distribution so that coordinates become approximately i.i.d. N(0, 1/d). This is the key insight from TurboQuant: it makes quantization **data-oblivious**, meaning no training data is required.
+1. **Random rotation** — A fixed orthogonal matrix transforms any embedding distribution so that coordinates become approximately i.i.d. N(0, 1/d). This is the key insight from TurboQuant: it makes quantization **data-oblivious**, meaning no training data is required.
+
+   Two constructions are available, selected by `rotation=`:
+
+   | | construction | d=768 | d=1536 | d=3072 |
+   |---|---|--:|--:|--:|
+   | `"haar"` *(default)* | Householder QR, O(d³) | 1.27 s | 10.44 s | 116.29 s |
+   | `"rht"` | randomized Hadamard, O(d² log d) | 0.034 s | 0.242 s | 1.00 s |
+   | | | **38×** | **43×** | **116×** |
+
+   *Building the rotation matrix only, min of 2, single-core Xeon @ 2.10 GHz.
+   Not `Quantizer.__init__` as a whole, which also builds the codebook.*
+
+   `"haar"` is [Haar-distributed](https://arxiv.org/abs/math-ph/0609050);
+   `"rht"` is the randomized Hadamard transform — the standard
+   incoherence-processing rotation, and what the coordinates-become-Gaussian
+   argument actually needs.
+
+   It measures indistinguishable from Haar on retrieval recall (−0.0001 ± 0.0013, pooled over 3 corpora × 6 bit widths × 5 seeds). So it is a build-time option, not a quality improvement — which is why the default has not moved. It needs an even `d`; odd dimensions raise and must use `"haar"`. The Mojo port rebuilds the same matrix byte-for-byte off the same PCG64 stream, so `polarquant --rotation rht` encodes identically.
 
 2. **[Lloyd-Max](https://en.wikipedia.org/wiki/Lloyd%27s_algorithm) scalar quantization** — Each coordinate is independently quantized using optimal boundaries for the N(0, 1/d) distribution. The codebook is computed from the theoretical Gaussian CDF, not from data. This produces the minimum mean-squared-error scalar quantizer for Gaussian inputs.
 
@@ -103,7 +121,7 @@ Full benchmark details and distribution sensitivity analysis in [`bench/RESULTS.
 
 - **You need high recall at aggressive compression on real data.** At 4-bit, FAISS PQ (m=96) achieves R@10=0.816 vs remex's 0.707 on real embeddings. Data-adaptive methods exploit structure that data-oblivious methods cannot.
 - **Your embeddings form very tight clusters.** When cluster spread σ < 0.05, 4-bit R@10 drops to 0.53 (from 0.85 at normal spread). Quantization errors flip rankings among near-identical vectors. 8-bit is much more robust (R@10 stays above 0.95).
-- **You need sublinear search.** remex is brute-force only. For >100k vectors, consider FAISS IVF, HNSW, or similar ANN indices. remex's compact encoding can feed into an external ANN index.
+- **You need sublinear search at high recall.** The flat scan is exhaustive; `IVFCoarseIndex` (below) gives a sublinear coarse tier but is approximate by construction and earns its keep only above ~10M vectors. For anything more demanding, consider FAISS IVF, HNSW, or similar — remex's compact encoding can feed an external ANN index.
 
 ### Distribution sensitivity (10k corpus, 4-bit, varying cluster tightness)
 
@@ -134,13 +152,14 @@ In-memory, indices are stored as uint8 for fast search. The `PackedVectors` clas
 
 ## API reference
 
-### `Quantizer(d, bits=4, seed=42)`
+### `Quantizer(d, bits=4, seed=42, rotation="haar")`
 
 Main quantizer class (formerly `PolarQuantizer`, which remains available as a deprecated alias).
 
 - **`d`** — Vector dimension (must match your embeddings).
 - **`bits`** — Bits per coordinate: 1-4 or 8. Sweet spot is 3-4. Use 8 for near-lossless.
 - **`seed`** — Random seed for the rotation matrix. Same seed = same quantizer.
+- **`rotation`** — `"haar"` (default) or `"rht"`. Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
 
 #### Methods
 
@@ -362,6 +381,11 @@ pytest tests/test_packed_vectors.py -v  # PackedVectors tests
 ```
 
 ## Mojo port (`polarquant`)
+
+**Checkout-only — the Mojo sources are deliberately excluded from the PyPI
+distribution** (`.mojo` files are not pip-installable and Mojo is not a
+declarable dependency), so `pip install remex` will not contain them. Clone the
+repository to build it.
 
 A standalone Mojo CLI binary lives in [`remex/mojo/`](remex/mojo/). It
 mirrors the encode + ADC search path with no Python runtime
