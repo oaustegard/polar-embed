@@ -20,7 +20,12 @@ from remex.ivf import IVFCoarseIndex
 from remex.packing import pack, unpack, packed_nbytes
 from remex.pq_format import save_pq, load_pq, save_params
 
-__version__ = "0.5.0"
+try:  # resolved from installed metadata, never hardcoded
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError
+
+    __version__ = _pkg_version("remex")
+except PackageNotFoundError:  # bare source checkout, not installed
+    __version__ = "0.0.0+unknown"
 __all__ = [
     "Quantizer", "CompressedVectors", "PackedVectors",
     "PolarQuantizer",  # deprecated alias
