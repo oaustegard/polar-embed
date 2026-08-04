@@ -71,6 +71,22 @@ rotation identity that is finally recorded on disk.
   references with ADC defined
   ([#33](https://github.com/oaustegard/remex/pull/33)).
 
+### Packaging
+
+- **The Mojo port is not in the PyPI distribution.** `.mojo` sources are not
+  installable by pip and Mojo is not a declarable dependency, so
+  `remex.mojo*` is now excluded from `packages.find`. Measured on the 0.6.0
+  build: before the exclude the wheel carried **zero** `.mojo` files but did
+  ship `remex/mojo/bench/compare.py` and two test-fixture builders — a package
+  path present in the wheel with its actual content absent. After, both wheel
+  and sdist contain zero `mojo` entries and eight `remex/*.py` modules. Run
+  the Mojo and GPU paths from a checkout.
+
+- **`__version__` is resolved from installed metadata.** It was the hardcoded
+  literal `"0.5.0"` — stale even against the v0.5.1 already on PyPI — so a
+  0.6.0 wheel reported 0.5.0 on import. Now `importlib.metadata.version`, with
+  `"0.0.0+unknown"` for a bare checkout. Same fix remax made in its v0.1.0.
+
 ### Changed
 
 - **The rotation is recorded in every container, and enforced on read**
