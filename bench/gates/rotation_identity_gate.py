@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import os
 import sys
 import tempfile
@@ -105,11 +106,31 @@ def _reference_codes(X: np.ndarray, kind: str) -> np.ndarray:
     return np.searchsorted(boundaries, rotated).astype(np.uint8)
 
 
+def _rotation_default_slot() -> int:
+    """Index of `rotation` within Quantizer.__init__.__defaults__.
+
+    Looked up by name rather than assumed to be last: `normalize` and
+    `scale` were added after it (#77), and a positional guess here would
+    have silently rebound one of those instead — leaving this gate green
+    while testing nothing.
+    """
+    spec = inspect.getfullargspec(Quantizer.__init__)
+    n_defaults = len(spec.defaults)
+    with_defaults = spec.args[-n_defaults:]
+    return with_defaults.index("rotation")
+
+
+def _library_default_rotation() -> str:
+    return Quantizer.__init__.__defaults__[_rotation_default_slot()]
+
+
 def _flip_library_default(kind: str) -> str:
     """Rebind Quantizer.__init__'s `rotation` default and return the old one."""
-    defaults = Quantizer.__init__.__defaults__
-    old = defaults[-1]
-    Quantizer.__init__.__defaults__ = defaults[:-1] + (kind,)
+    slot = _rotation_default_slot()
+    defaults = list(Quantizer.__init__.__defaults__)
+    old = defaults[slot]
+    defaults[slot] = kind
+    Quantizer.__init__.__defaults__ = tuple(defaults)
     return old
 
 
@@ -155,7 +176,7 @@ def main() -> int:
 
         def _prefix_load(path):
             cv = _real_load(path)
-            live_default = Quantizer.__init__.__defaults__[-1]
+            live_default = _library_default_rotation()
             return CompressedVectors(
                 cv.indices, cv.norms, cv.d, cv.bits, live_default
             )
@@ -211,7 +232,7 @@ def main() -> int:
     try:
         after = load_pq(pq_path)
         g.check(
-            Quantizer.__init__.__defaults__[-1] == "rht",
+            _library_default_rotation() == "rht",
             "library default really was flipped for this run",
             "guards against the flip silently not taking",
         )

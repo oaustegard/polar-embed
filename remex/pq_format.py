@@ -7,14 +7,22 @@ Layout (little-endian):
     bytes 4-7   : d (u32)
     bytes 8-15  : n (u64)
     byte 16     : bits (u8)
-    byte 17     : rotation code (u8) — 0 = haar, 1 = rht
-    bytes 18-31 : reserved (14 zero bytes)
+    byte 17     : rotation code (u8) — 0 = haar, 1 = rht, 2 = none
+    byte 18     : flags (u8) — bit 0 set = scalar mode, no norms section
+    bytes 19-31 : reserved (13 zero bytes)
     bytes 32+   : packed_indices (length = packed_nbytes(n*d, bits))
-    then        : norms (n × float32, little-endian)
+    then        : norms (n × float32, little-endian), absent in scalar mode
 
 This is a minimal alternative to the Python `.npz` format that is trivially
 parseable from Mojo without unzip/numpy-header machinery. See
 `remex/mojo/src/pq_format.mojo`.
+
+The flags byte lives in what byte 18 already was — reserved and zero — so
+every file written before it existed reads back as "has norms", which they
+all do. In the other direction a scalar-mode file is *shorter* than an old
+reader's arithmetic expects, so it fails the length check as
+"truncated .pq data" rather than silently reading indices as norms. The
+Mojo port is one such reader: it does not implement scalar mode yet.
 """
 
 from __future__ import annotations
@@ -41,6 +49,9 @@ PARAMS_HEADER_BYTES = 16
 PARAMS_VERSION = 1
 PARAMS_MAGIC = b"PR\x00\x01"
 
+#: Byte 18, bit 0: the norms section is absent (scalar mode).
+PQ_FLAG_NO_NORMS = 0x01
+
 
 # Rotations the Mojo port can rebuild from `(d, seed)` alone, mapped to the
 # `polarquant` flag that selects each one. `--params` reads R straight out of
@@ -61,6 +72,15 @@ def save_params(path: str | Path, quantizer: "Quantizer") -> None:
     from the seed instead; that path needs a construction Mojo actually
     implements, which is what the check below is for.
     """
+    if not getattr(quantizer, "normalize", True):
+        raise ValueError(
+            "save_params does not support scalar-mode quantizers "
+            "(normalize=False). The Mojo encoder always normalizes and "
+            "always writes norms, so it would encode different codes from "
+            "these params, and a parity check against it would compare two "
+            "different pipelines."
+        )
+
     rotation = getattr(quantizer, "rotation", "haar")
     if rotation not in MOJO_ROTATIONS:
         raise ValueError(
@@ -95,7 +115,12 @@ def save_params(path: str | Path, quantizer: "Quantizer") -> None:
 
 
 def save_pq(path: str | Path, compressed: "CompressedVectors") -> None:
-    """Serialize a CompressedVectors to the .pq binary format."""
+    """Serialize a CompressedVectors to the .pq binary format.
+
+    A scalar-mode container (``norms is None``) sets the no-norms flag and
+    writes no norms section. Such a file is readable by ``load_pq`` but not
+    yet by the Mojo port.
+    """
     n, d, bits = int(compressed.n), int(compressed.d), int(compressed.bits)
     packed = pack(compressed.indices.ravel(), bits)
     expected_packed = packed_nbytes(n, d, bits)
@@ -111,13 +136,15 @@ def save_pq(path: str | Path, compressed: "CompressedVectors") -> None:
     header[8:16] = struct.pack("<Q", n)
     header[16] = bits & 0xFF
     header[17] = ROTATION_CODES[validate_rotation(compressed.rotation)]
-
-    norms = np.ascontiguousarray(compressed.norms, dtype=np.float32)
+    if compressed.norms is None:
+        header[18] = PQ_FLAG_NO_NORMS
 
     with open(path, "wb") as f:
         f.write(bytes(header))
         f.write(packed.tobytes())
-        f.write(norms.tobytes())
+        if compressed.norms is not None:
+            norms = np.ascontiguousarray(compressed.norms, dtype=np.float32)
+            f.write(norms.tobytes())
 
 
 def load_pq(path: str | Path) -> "CompressedVectors":
@@ -138,13 +165,22 @@ def load_pq(path: str | Path) -> "CompressedVectors":
     # Byte 17 was reserved-and-zero before this field existed, and 0 is
     # haar, so a pre-field file resolves to LEGACY_ROTATION for free.
     rotation = rotation_from_code(raw[17])
+    flags = raw[18]
+    unknown_flags = flags & ~PQ_FLAG_NO_NORMS
+    if unknown_flags:
+        raise ValueError(
+            f"unknown .pq flag bits 0x{unknown_flags:02x} in header; this "
+            f"file was written by a newer remex."
+        )
+    has_norms = not (flags & PQ_FLAG_NO_NORMS)
     if bits in (5, 6, 7):
         raise ValueError(
             f"bits={bits} is not supported. Use 1-4 or 8 bits."
         )
 
     expected_packed = packed_nbytes(n, d, bits)
-    expected_total = PQ_HEADER_BYTES + expected_packed + n * 4
+    norms_bytes = n * 4 if has_norms else 0
+    expected_total = PQ_HEADER_BYTES + expected_packed + norms_bytes
     if len(raw) < expected_total:
         raise ValueError("truncated .pq data")
 
@@ -153,11 +189,14 @@ def load_pq(path: str | Path) -> "CompressedVectors":
         count=expected_packed,
         offset=PQ_HEADER_BYTES,
     )
-    norms = np.frombuffer(
-        raw, dtype=np.float32,
-        count=n,
-        offset=PQ_HEADER_BYTES + expected_packed,
-    )
+    if has_norms:
+        norms = np.frombuffer(
+            raw, dtype=np.float32,
+            count=n,
+            offset=PQ_HEADER_BYTES + expected_packed,
+        ).copy()
+    else:
+        norms = None
 
     indices = unpack(packed, bits, n * d).reshape(n, d)
-    return CompressedVectors(indices.copy(), norms.copy(), d, bits, rotation)
+    return CompressedVectors(indices.copy(), norms, d, bits, rotation)

@@ -7,12 +7,23 @@ Layout (all little-endian):
   bytes 4-7   : d (u32)
   bytes 8-15  : n (u64)
   byte 16     : bits (u8)
-  byte 17     : rotation code (u8) — 0 = haar, 1 = rht
-  bytes 18-31 : reserved (14 zero bytes) — header padded to 32 bytes
+  byte 17     : rotation code (u8) — 0 = haar, 1 = rht, 2 = none (identity)
+  byte 18     : flags (u8) — bit 0 set = scalar mode, norms section absent
+  bytes 19-31 : reserved (13 zero bytes) — header padded to 32 bytes
   bytes 32+   : packed_indices (length = packed_nbytes(n*d, bits))
   then        : norms (n × float32)
 
 The Python side mirrors this in `remex.pq_format.{save_pq, load_pq}`.
+
+This reader implements neither of the two values Python can now write:
+rotation code 2 and the scalar-mode flag both come from
+`Quantizer(normalize=False)` (remex #77), which has no Mojo encoder. Both
+fail loudly rather than silently. Code 2 is not a rotation this port can
+build, and a scalar-mode file carries no norms section, so it is `n * 4`
+bytes shorter than the length check below expects and is rejected as
+truncated. Neither can appear in a file this port wrote, and no file
+written before the flags byte existed sets it — byte 18 was reserved and
+zero.
 """
 
 from std.pathlib import Path

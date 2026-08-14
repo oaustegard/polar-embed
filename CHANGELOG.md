@@ -2,7 +2,50 @@
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- **Scalar mode — `Quantizer(d, bits, normalize=False, scale=1.0)`**
+  ([#77](https://github.com/oaustegard/remex/issues/77)). Quantizes the
+  (optionally rotated) coordinates directly with the Lloyd-Max codebook:
+  no unit-sphere factorization, no norms computed or stored, codes are the
+  whole output. For use cases where the codes *are* the product — exact-match
+  hash keys for a join, bucketing, dedup — the default pipeline works against
+  you twice: unit-norm factorization maps every constant-direction family onto
+  a single direction code, and the float32 cast that buys `.pq` parity with
+  the Mojo port turns large values into `inf`. Scalar mode drops the first and
+  works in float64, saturating at the outermost cell instead. Lloyd-Max cell
+  shaping, Matryoshka nesting and determinism are unchanged.
+
+- **`rotation="none"`** — the identity, on-disk code 2. Intended for scalar
+  mode, where it makes a code a bare `searchsorted` of the input value: no
+  matmul, so identical inputs give identical codes across BLAS builds and
+  thread counts, and coordinate *j* of the code depends only on coordinate
+  *j* of the input.
+
+- **`sigma` on `lloyd_max_codebook` / `nested_codebooks`**, plus
+  `coordinate_sigma(d, sigma)` — the coordinate spread the cells are cut for.
+  `None` remains the unit-sphere `1/sqrt(d)`, bit-for-bit as before.
+
+- **`has_norms`** on `CompressedVectors` / `PackedVectors`.
+
+### Changed
+
+- `norms` is now optional on `CompressedVectors` and `PackedVectors`, and its
+  absence is how every serializer records scalar mode: no `norms` entry in
+  `.npz`, no `norms` column in Arrow, and a no-norms flag at `.pq` byte 18
+  bit 0 (previously reserved-and-zero, so existing files are unaffected).
+  A scalar-mode `.pq` is *shorter* than an old reader's arithmetic expects, so
+  such a reader — the Mojo port included — fails it as truncated rather than
+  reading indices as norms. `save_params` rejects a scalar quantizer for the
+  same reason.
+
+- Decoding or searching codes with a quantizer in the other mode now raises
+  `mode mismatch`, alongside the existing `rotation mismatch` check. The two
+  codebooks differ by a factor of `scale * sqrt(d)`, so crossing them would
+  otherwise rescale every reconstructed coordinate.
+
+The default path is untouched: same codes, same files, same
+`(d, bits, seed, rotation)` determinism.
 
 ## v0.6.0 — 2026-08-04
 
