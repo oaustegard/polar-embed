@@ -98,7 +98,7 @@ def test_readme_quantizer_signature_claims_hold():
     that sentence becomes the kind of confident-and-wrong prose this file
     exists to catch."""
     text = README.read_text(encoding="utf-8")
-    assert "(d, bits, seed, rotation)" in text, (
+    assert "(d, bits, seed, rotation, normalize, scale)" in text, (
         "README no longer states the full determining tuple; if a determinant "
         "was added or removed, update the sentence and this assertion together"
     )

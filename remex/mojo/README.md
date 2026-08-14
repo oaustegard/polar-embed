@@ -144,7 +144,8 @@ guaranteed bit parity regardless of bit width or potential drift.
 
 ### The index records its rotation
 
-`.pq` byte 17 holds the rotation code (`0` = haar, `1` = rht) and
+`.pq` byte 17 holds the rotation code (`0` = haar, `1` = rht; Python also
+writes `2` = none, see below) and
 `.params` byte 9 mirrors it. Both were reserved-and-zero before the field
 existed, and haar is `0`, so every previously written file reads back as
 haar with no compatibility branch — which is the correct answer for all
@@ -154,6 +155,18 @@ rotation; the two constructions differ on roughly half their stored bits,
 so the results would look plausible and be wrong. `--params` skips the
 check, since the matrix comes from the file and there is nothing to
 disagree with.
+
+### Not ported: scalar mode
+
+Python's `Quantizer(normalize=False)` (remex #77) quantizes coordinates
+directly, storing no norms, and pairs with a third rotation code (`2` =
+none, the identity). `polarquant` implements neither, and needs no
+compatibility branch to stay safe: rotation code `2` fails the `> 1` check
+in `load_pq`, and a scalar-mode `.pq` has no norms section, so it is
+`n * 4` bytes shorter than the reader's length arithmetic expects and is
+rejected as truncated. The flag that marks it lives in byte 18, which was
+reserved-and-zero before, so files written by this port are unaffected in
+either direction.
 
 ### 8-bit byte-parity caveat
 

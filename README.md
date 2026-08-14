@@ -20,7 +20,7 @@ from remex import CompressedVectors
 loaded = CompressedVectors.load("index.npz")
 ```
 
-The quantizer is fully determined by `(d, bits, seed, rotation)` — no training, no fitting, no index to ship. `rotation` defaults to `"haar"` and is part of the encoding exactly as `seed` is; every container records it, and decoding against the wrong one raises rather than returning wrong-but-plausible vectors.
+The quantizer is fully determined by `(d, bits, seed, rotation, normalize, scale)` — no training, no fitting, no index to ship. `rotation` defaults to `"haar"` and is part of the encoding exactly as `seed` is; every container records it, and decoding against the wrong one raises rather than returning wrong-but-plausible vectors. `normalize` and `scale` select the pipeline described below versus [scalar mode](#scalar-mode-codes-as-hash-keys), and default to the former.
 
 ## How it works
 
@@ -152,14 +152,16 @@ In-memory, indices are stored as uint8 for fast search. The `PackedVectors` clas
 
 ## API reference
 
-### `Quantizer(d, bits=4, seed=42, rotation="haar")`
+### `Quantizer(d, bits=4, seed=42, rotation="haar", normalize=True, scale=None)`
 
 Main quantizer class (formerly `PolarQuantizer`, which remains available as a deprecated alias).
 
 - **`d`** — Vector dimension (must match your embeddings).
 - **`bits`** — Bits per coordinate: 1-4 or 8. Sweet spot is 3-4. Use 8 for near-lossless.
 - **`seed`** — Random seed for the rotation matrix. Same seed = same quantizer.
-- **`rotation`** — `"haar"` (default) or `"rht"`. Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
+- **`rotation`** — `"haar"` (default), `"rht"`, or `"none"` (the identity — see [scalar mode](#scalar-mode-codes-as-hash-keys)). Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
+- **`normalize`** — `True` (default) factors each vector into unit direction plus a stored norm, as described above. `False` selects [scalar mode](#scalar-mode-codes-as-hash-keys): quantize the coordinates directly, store no norms. Also part of the encoding — a mismatch raises.
+- **`scale`** — Scalar mode only (default `1.0`): the coordinate standard deviation the Lloyd-Max cells are cut for. The normalizing path derives it from the unit sphere as `1/sqrt(d)` and rejects an explicit value.
 
 #### Methods
 
@@ -188,6 +190,7 @@ Container for quantized data. Created by `Quantizer.encode()`. Stores indices as
 - **`nbytes_unpacked`** — In-memory size (uint8 indices + float32 norms).
 - **`compression_ratio`** — `(n * d * 4) / nbytes`.
 - **`resident_bytes`** — Actual RAM including any active caches.
+- **`has_norms`** — `False` for scalar-mode containers, whose `norms` is `None`. Both size properties account for the absent column.
 
 #### Methods
 
@@ -333,8 +336,38 @@ from remex import lloyd_max_codebook, nested_codebooks
 
 - **`pack(indices, bits)`** / **`unpack(packed, bits, n_values)`** — Bit-pack/unpack uint8 arrays.
 - **`packed_nbytes(n_values, d, bits)`** — Compute packed byte count.
-- **`lloyd_max_codebook(d, bits)`** — Generate optimal boundaries and centroids for N(0, 1/d).
-- **`nested_codebooks(d, max_bits)`** — Build Matryoshka centroid tables for all bit levels 1..max_bits.
+- **`lloyd_max_codebook(d, bits, sigma=None)`** — Generate optimal boundaries and centroids for N(0, sigma); `sigma=None` is the unit-sphere value `1/sqrt(d)`.
+- **`nested_codebooks(d, max_bits, sigma=None)`** — Build Matryoshka centroid tables for all bit levels 1..max_bits.
+
+## Scalar mode: codes as hash keys
+
+`Quantizer(normalize=False)` skips the unit-sphere factorization and quantizes the (optionally rotated) coordinates directly. No norms are computed, none are stored, and the codes are the whole output.
+
+```python
+import numpy as np
+from remex import Quantizer
+
+# Enumerated algebraic values, not embeddings: heavy-tailed, and full of
+# near-parallel families that a unit-norm factorization would collapse.
+values = np.array([[c, c, 2 * c, -c] for c in (0.1, 0.7, 1.3, 2.0)])
+
+pq = Quantizer(d=4, bits=4, normalize=False, rotation="none", scale=1.0)
+codes = pq.encode(values).indices          # (n, 4) uint8, and no norms array
+keys = [bytes(row) for row in codes]       # exact-match hash keys
+
+coarse = codes >> 2                        # 2-bit keys: coarser, more collisions
+```
+
+Use it when the codes themselves are the product — hash keys for a join, bucketing, dedup — rather than an approximation of a direction. Two properties of the default pipeline work against that:
+
+- **Unit-norm factorization collapses constant-direction families.** Every `c * ones(d)` shares one direction code, differing only in the norm that scalar mode does not store. On roughly isotropic embeddings that is harmless; on enumerated values those families are enormous, and the shared code is a mega-bucket rather than a key.
+- **float32 range.** The normalizing path casts input to float32 and stores float32 norms (for byte-identical [`.pq` parity with the Mojo port](#mojo-port-polarquant)). Values past ~3.4e38 become `inf` there. Scalar mode works in float64 and saturates at the outermost cell instead.
+
+What is unchanged: Lloyd-Max cell shaping, Matryoshka nesting (right-shift a code for a coarser one — a per-query collision/recall dial), and determinism, which is what makes a code usable as an exact-match key at all. `rotation="none"` strengthens that last point: with no rotation matmul in the way, a code is a bare `searchsorted` of the input value, identical across BLAS builds and thread counts, and coordinate *j* of the code depends only on coordinate *j* of the input.
+
+**You own the range conditioning.** remex stays data-oblivious and will not measure your data to pick cells. Bound your inputs or push heavy tails through `arcsinh`/`log`, then set `scale` to the spread you conditioned them to; anything past `±3 * scale` lands in an outermost cell.
+
+Scalar-mode containers carry `norms is None`, which is how every serializer marks them: no `norms` entry in `.npz`, no `norms` column in Arrow, and the no-norms flag (byte 18, bit 0) in `.pq`. Mixing the two modes raises rather than silently rescaling every coordinate. The Mojo port always normalizes, so it does not read scalar-mode `.pq` files and `save_params` rejects a scalar quantizer.
 
 ## vs TurboQuant
 

@@ -2,30 +2,51 @@
 
 import numpy as np
 from scipy.stats import norm
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
+
+
+def coordinate_sigma(d: int, sigma: Optional[float] = None) -> float:
+    """Resolve the coordinate standard deviation a codebook is built for.
+
+    ``None`` means the unit-sphere default, ``1/sqrt(d)``: after a random
+    orthogonal rotation of a *unit* vector in R^d each coordinate
+    concentrates to N(0, 1/d). Scalar mode (``Quantizer(normalize=False)``)
+    skips the normalization, so its coordinate scale is the caller's to
+    declare and is passed in explicitly.
+    """
+    if sigma is None:
+        return 1.0 / float(np.sqrt(d))
+    sigma = float(sigma)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError(f"sigma must be finite and positive, got {sigma!r}")
+    return sigma
 
 
 def lloyd_max_codebook(
-    d: int, bits: int, n_iter: int = 300
+    d: int, bits: int, n_iter: int = 300, sigma: Optional[float] = None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Build optimal Lloyd-Max codebook for N(0, 1/d) distributed coordinates.
+    Build optimal Lloyd-Max codebook for N(0, sigma) distributed coordinates.
 
     After random orthogonal rotation of unit vectors in R^d, each coordinate
     follows a distribution that concentrates to N(0, 1/d) as d grows.
     The Lloyd-Max quantizer minimizes MSE for this known distribution.
 
     Args:
-        d: Vector dimension (determines coordinate variance = 1/d).
+        d: Vector dimension (determines the default coordinate variance = 1/d).
         bits: Quantization bit-width (produces 2^bits levels).
         n_iter: Lloyd-Max iteration count.
+        sigma: Coordinate standard deviation to optimize for. ``None``
+            (default) is ``1/sqrt(d)``, the unit-sphere value — pass an
+            explicit sigma only when the coordinates were not unit-normalized
+            first (see ``Quantizer(normalize=False)``).
 
     Returns:
         boundaries: (2^bits - 1,) decision boundaries for np.searchsorted.
         centroids: (2^bits,) reconstruction values.
     """
     n_levels = 2**bits
-    sigma = 1.0 / np.sqrt(d)
+    sigma = coordinate_sigma(d, sigma)
     rv = norm(0, sigma)
 
     centroids = np.linspace(-3 * sigma, 3 * sigma, n_levels)
@@ -57,7 +78,7 @@ def lloyd_max_codebook(
 
 
 def nested_codebooks(
-    d: int, max_bits: int
+    d: int, max_bits: int, sigma: Optional[float] = None
 ) -> Dict[int, np.ndarray]:
     """
     Build nested centroid tables for Matryoshka-style bit precision.
@@ -74,14 +95,16 @@ def nested_codebooks(
     Args:
         d: Vector dimension.
         max_bits: Maximum quantization bit-width.
+        sigma: Coordinate standard deviation, as in ``lloyd_max_codebook``.
+            ``None`` (default) is the unit-sphere value ``1/sqrt(d)``.
 
     Returns:
         Dict mapping bit-width to centroid array:
         {max_bits: (2^max_bits,), max_bits-1: (2^(max_bits-1),), ..., 1: (2,)}
     """
-    _, centroids_max = lloyd_max_codebook(d, max_bits)
+    sigma = coordinate_sigma(d, sigma)
+    _, centroids_max = lloyd_max_codebook(d, max_bits, sigma=sigma)
     n_max = len(centroids_max)
-    sigma = 1.0 / np.sqrt(d)
     rv = norm(0, sigma)
 
     # Probability mass for each max_bits bin

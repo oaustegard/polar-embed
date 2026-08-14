@@ -46,7 +46,9 @@ from __future__ import annotations
 import numpy as np
 from typing import Optional, Tuple
 
-from remex.core import CompressedVectors, PackedVectors, Quantizer
+from remex.core import (
+    CompressedVectors, PackedVectors, Quantizer, _apply_norms,
+)
 
 
 _VALID_MODES = ("lsh", "rotated_prefix")
@@ -246,7 +248,7 @@ class IVFCoarseIndex:
         hashing so it lives in the same frame as the corpus hash.
         """
         q = np.asarray(query, dtype=np.float32)
-        q_rot = self.quantizer.R @ q
+        q_rot = self.quantizer._rotate_query(q)
         return self._query_cell_from_rot(q_rot)
 
     def probe_cells(self, query_cell: int, nprobe: int) -> np.ndarray:
@@ -328,7 +330,7 @@ class IVFCoarseIndex:
             total candidate count across the visited cells.
         """
         q = np.asarray(query, dtype=np.float32)
-        q_rot = self.quantizer.R @ q
+        q_rot = self.quantizer._rotate_query(q)
 
         q_cell = self._query_cell_from_rot(q_rot)
         cand = self.candidate_indices(q_cell, nprobe)
@@ -353,7 +355,8 @@ class IVFCoarseIndex:
             shift = self.quantizer.bits - precision
             cand_idx = cand_idx >> shift
 
-        cand_norms = self.compressed.norms[cand]
+        norms = self.compressed.norms
+        cand_norms = None if norms is None else norms[cand]
         d = self.d
         dim_idx = np.arange(d)
         scores = np.empty(n_cand, dtype=np.float32)
@@ -362,7 +365,10 @@ class IVFCoarseIndex:
             end = min(start + chunk_size, n_cand)
             chunk_idx = cand_idx[start:end]
             chunk_scores = table[dim_idx, chunk_idx].sum(axis=1)
-            scores[start:end] = chunk_scores * cand_norms[start:end]
+            scores[start:end] = _apply_norms(
+                chunk_scores,
+                None if cand_norms is None else cand_norms[start:end],
+            )
 
         k_eff = min(k, n_cand)
         if k_eff >= n_cand:
@@ -420,7 +426,7 @@ class IVFCoarseIndex:
             )
 
         q = np.asarray(query, dtype=np.float32)
-        q_rot = self.quantizer.R @ q
+        q_rot = self.quantizer._rotate_query(q)
         fine_centroids = self.quantizer._resolve_centroids(
             self.compressed, None
         )
@@ -430,7 +436,11 @@ class IVFCoarseIndex:
             fine_indices = self.compressed.indices[coarse_idx]
         X_hat_cand = fine_centroids[fine_indices]
 
-        fine_scores = (X_hat_cand @ q_rot) * self.compressed.norms[coarse_idx]
+        norms = self.compressed.norms
+        fine_scores = _apply_norms(
+            X_hat_cand @ q_rot,
+            None if norms is None else norms[coarse_idx],
+        )
         k_eff = min(k, len(coarse_idx))
         order = np.argsort(-fine_scores)[:k_eff]
         return coarse_idx[order], fine_scores[order]

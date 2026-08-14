@@ -2,11 +2,31 @@
 
 import numpy as np
 from typing import Optional, Tuple, Iterable
-from remex.codebook import lloyd_max_codebook, nested_codebooks
+from remex.codebook import (
+    coordinate_sigma, lloyd_max_codebook, nested_codebooks,
+)
 from remex.packing import pack, unpack, packed_nbytes
 from remex.rotation import (
-    LEGACY_ROTATION, haar_rotation, rht_rotation, validate_rotation,
+    LEGACY_ROTATION, haar_rotation, identity_rotation, rht_rotation,
+    validate_rotation,
 )
+
+
+def _norms_nbytes(norms: Optional[np.ndarray]) -> int:
+    """Bytes the norms column costs — zero in scalar mode, where it is absent."""
+    return 0 if norms is None else norms.nbytes
+
+
+def _apply_norms(
+    scores: np.ndarray, norms: Optional[np.ndarray]
+) -> np.ndarray:
+    """Rescale unit-sphere scores by the stored norms.
+
+    ``norms is None`` is scalar mode: the codes quantize the coordinates
+    themselves, so the lookup already is the approximate inner product and
+    there is nothing to rescale.
+    """
+    return scores if norms is None else scores * norms
 
 
 class CompressedVectors:
@@ -15,11 +35,16 @@ class CompressedVectors:
     Indices are stored as uint8 in memory for fast search/decode.
     Bit-packing is used for serialization (save/load) and for
     computing the true compressed size (nbytes).
+
+    ``norms`` is ``None`` for containers produced by a scalar-mode
+    quantizer (``Quantizer(normalize=False)``), which quantizes raw
+    coordinates and keeps no per-vector norm.
     """
 
     __slots__ = ("indices", "norms", "d", "bits", "n", "rotation", "_x_hat_rot")
 
-    def __init__(self, indices: np.ndarray, norms: np.ndarray, d: int, bits: int,
+    def __init__(self, indices: np.ndarray, norms: Optional[np.ndarray],
+                 d: int, bits: int,
                  rotation: str = LEGACY_ROTATION):
         self.indices = indices  # (n, d) uint8 — unpacked for fast access
         self.norms = norms
@@ -29,10 +54,17 @@ class CompressedVectors:
         self.rotation = validate_rotation(rotation)
         self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
 
+    @property
+    def has_norms(self) -> bool:
+        """False for scalar-mode codes, which store no per-vector norm."""
+        return self.norms is not None
+
     def subset(self, idx: np.ndarray) -> "CompressedVectors":
         """Return a CompressedVectors containing only the given row indices."""
         sub = CompressedVectors(
-            self.indices[idx], self.norms[idx], self.d, self.bits, self.rotation
+            self.indices[idx],
+            None if self.norms is None else self.norms[idx],
+            self.d, self.bits, self.rotation,
         )
         if self._x_hat_rot is not None:
             sub._x_hat_rot = self._x_hat_rot[idx]
@@ -41,12 +73,12 @@ class CompressedVectors:
     @property
     def nbytes(self) -> int:
         """Packed memory footprint in bytes (honest compression)."""
-        return packed_nbytes(self.n, self.d, self.bits) + self.norms.nbytes
+        return packed_nbytes(self.n, self.d, self.bits) + _norms_nbytes(self.norms)
 
     @property
     def nbytes_unpacked(self) -> int:
         """Unpacked memory footprint (what's actually in RAM)."""
-        return self.indices.nbytes + self.norms.nbytes
+        return self.indices.nbytes + _norms_nbytes(self.norms)
 
     @property
     def compression_ratio(self) -> float:
@@ -56,7 +88,7 @@ class CompressedVectors:
     @property
     def resident_bytes(self) -> int:
         """Actual RAM footprint including any active caches."""
-        total = self.indices.nbytes + self.norms.nbytes
+        total = self.indices.nbytes + _norms_nbytes(self.norms)
         if self._x_hat_rot is not None:
             total += self._x_hat_rot.nbytes
         return total
@@ -66,16 +98,23 @@ class CompressedVectors:
         self._x_hat_rot = None
 
     def save(self, path: str):
-        """Save to compressed .npz file with bit-packed indices."""
+        """Save to compressed .npz file with bit-packed indices.
+
+        Scalar-mode containers write no ``norms`` entry at all; its absence
+        is what marks the file as scalar mode on load. Every file written
+        by the normalizing path has one, so there is no ambiguity with
+        older files.
+        """
         packed_idx = pack(self.indices.ravel(), self.bits)
+        optional = {} if self.norms is None else {"norms": self.norms}
         np.savez_compressed(
             path,
             packed_indices=packed_idx,
-            norms=self.norms,
             d=np.int32(self.d),
             bits=np.int32(self.bits),
             n=np.int32(self.n),
             rotation=np.str_(self.rotation),
+            **optional,
         )
 
     @classmethod
@@ -85,6 +124,8 @@ class CompressedVectors:
         A file with no ``rotation`` entry predates the field and is Haar —
         see ``remex.rotation.LEGACY_ROTATION`` for why that is a frozen
         constant rather than the current default.
+
+        A file with no ``norms`` entry is scalar mode (``normalize=False``).
         """
         data = np.load(path)
         d = int(data["d"])
@@ -99,7 +140,8 @@ class CompressedVectors:
             # Backward compat: old format stored unpacked indices
             indices = data["indices"]
 
-        return cls(indices, data["norms"], d, bits, rotation)
+        norms = data["norms"] if "norms" in data else None
+        return cls(indices, norms, d, bits, rotation)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format, packing indices for storage.
@@ -149,7 +191,7 @@ class PackedVectors:
     def __init__(
         self,
         packed: np.ndarray,
-        norms: np.ndarray,
+        norms: Optional[np.ndarray],
         n: int,
         d: int,
         bits: int,
@@ -158,7 +200,8 @@ class PackedVectors:
         """
         Args:
             packed: (n, row_bytes) uint8 array of bit-packed indices.
-            norms: (n,) float32 array of vector norms.
+            norms: (n,) float32 array of vector norms, or ``None`` for
+                scalar-mode codes (``Quantizer(normalize=False)``).
             n: Number of vectors.
             d: Vector dimension.
             bits: Bits per coordinate.
@@ -173,6 +216,11 @@ class PackedVectors:
         self.rotation = validate_rotation(rotation)
         self._row_bytes = packed_nbytes(1, d, bits)
         self._row_aligned = (d * bits) % 8 == 0
+
+    @property
+    def has_norms(self) -> bool:
+        """False for scalar-mode codes, which store no per-vector norm."""
+        return self.norms is not None
 
     def unpack_rows(self, start: int, end: int) -> np.ndarray:
         """Decompress a contiguous row slice to uint8 indices.
@@ -236,14 +284,14 @@ class PackedVectors:
             packed = np.empty((n, row_bytes), dtype=np.uint8)
             for i in range(n):
                 packed[i] = pack(compressed.indices[i], bits)
-        return cls(packed, compressed.norms.copy(), n, d, bits,
-                   compressed.rotation)
+        norms = None if compressed.norms is None else compressed.norms.copy()
+        return cls(packed, norms, n, d, bits, compressed.rotation)
 
     @classmethod
     def from_rows(
         cls,
         rows: Iterable,
-        norms: np.ndarray,
+        norms: Optional[np.ndarray],
         d: int,
         bits: int,
         rotation: str = LEGACY_ROTATION,
@@ -252,7 +300,8 @@ class PackedVectors:
 
         Args:
             rows: Iterable of bytes/bytearray/ndarray, one per vector.
-            norms: (n,) float32 array of vector norms.
+            norms: (n,) float32 array of vector norms, or ``None`` for
+                scalar-mode codes.
             d: Vector dimension.
             bits: Bits per coordinate.
             rotation: Which rotation encoded these codes. The database
@@ -271,8 +320,9 @@ class PackedVectors:
                 row_list.append(np.asarray(r, dtype=np.uint8))
         packed = np.stack(row_list)
         n = len(row_list)
-        return cls(packed, np.asarray(norms, dtype=np.float32), n, d, bits,
-                   rotation)
+        if norms is not None:
+            norms = np.asarray(norms, dtype=np.float32)
+        return cls(packed, norms, n, d, bits, rotation)
 
     def at_precision(self, target_bits: int) -> "PackedVectors":
         """Derive a lower-bit representation via Matryoshka right-shift.
@@ -312,7 +362,7 @@ class PackedVectors:
                     packed_target[start + i] = pack(shifted[i], target_bits)
 
         return PackedVectors(
-            packed_target, self.norms.copy(), self.n, self.d, target_bits,
+            packed_target, self._copy_norms(), self.n, self.d, target_bits,
             self.rotation,
         )
 
@@ -320,7 +370,7 @@ class PackedVectors:
         """Convert to CompressedVectors by unpacking all indices."""
         indices = self.unpack_rows(0, self.n)
         return CompressedVectors(
-            indices, self.norms.copy(), self.d, self.bits, self.rotation
+            indices, self._copy_norms(), self.d, self.bits, self.rotation
         )
 
     def subset(self, idx: np.ndarray) -> "PackedVectors":
@@ -328,22 +378,25 @@ class PackedVectors:
         idx = np.asarray(idx)
         return PackedVectors(
             self._packed[idx].copy(),
-            self.norms[idx].copy(),
+            None if self.norms is None else self.norms[idx].copy(),
             len(idx),
             self.d,
             self.bits,
             self.rotation,
         )
 
+    def _copy_norms(self) -> Optional[np.ndarray]:
+        return None if self.norms is None else self.norms.copy()
+
     @property
     def nbytes(self) -> int:
         """Packed memory footprint in bytes."""
-        return self._packed.nbytes + self.norms.nbytes
+        return self._packed.nbytes + _norms_nbytes(self.norms)
 
     @property
     def resident_bytes(self) -> int:
         """Actual RAM footprint (same as nbytes — no caches)."""
-        return self._packed.nbytes + self.norms.nbytes
+        return self._packed.nbytes + _norms_nbytes(self.norms)
 
     @property
     def compression_ratio(self) -> float:
@@ -351,15 +404,20 @@ class PackedVectors:
         return (self.n * self.d * 4) / self.nbytes
 
     def save(self, path: str):
-        """Save to compressed .npz file."""
+        """Save to compressed .npz file.
+
+        As with ``CompressedVectors.save``, a scalar-mode container writes
+        no ``norms`` entry.
+        """
+        optional = {} if self.norms is None else {"norms": self.norms}
         np.savez_compressed(
             path,
             packed_indices=self._packed.ravel(),
-            norms=self.norms,
             d=np.int32(self.d),
             bits=np.int32(self.bits),
             n=np.int32(self.n),
             rotation=np.str_(self.rotation),
+            **optional,
         )
 
     @classmethod
@@ -367,6 +425,7 @@ class PackedVectors:
         """Load from .npz file, keeping indices packed.
 
         A file with no ``rotation`` entry predates the field and is Haar.
+        A file with no ``norms`` entry is scalar mode.
         """
         data = np.load(path)
         d = int(data["d"])
@@ -376,13 +435,15 @@ class PackedVectors:
         row_bytes = packed_nbytes(1, d, bits)
         packed_flat = data["packed_indices"]
         packed = packed_flat.reshape(n, row_bytes)
-        return cls(packed, data["norms"], n, d, bits, rotation)
+        norms = data["norms"] if "norms" in data else None
+        return cls(packed, norms, n, d, bits, rotation)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format.
 
         Stores packed indices as FixedSizeBinary and norms as Float32,
-        with quantizer parameters in schema-level metadata.
+        with quantizer parameters in schema-level metadata. A scalar-mode
+        container has no norms, so the file has no ``norms`` column.
 
         Requires pyarrow (optional dependency).
 
@@ -413,23 +474,20 @@ class PackedVectors:
             key = k.encode() if isinstance(k, str) else k
             metadata[key] = str(v).encode()
 
-        schema = pa.schema(
-            [
-                pa.field("norms", pa.float32()),
-                pa.field("packed_indices", pa.binary(row_bytes)),
-            ],
-            metadata=metadata,
-        )
-
-        # Build arrays from flat buffers for efficiency
-        norms_arr = pa.array(self.norms.tolist(), type=pa.float32())
+        fields = [pa.field("packed_indices", pa.binary(row_bytes))]
         packed_buf = pa.py_buffer(self._packed.tobytes())
-        packed_arr = pa.FixedSizeBinaryArray.from_buffers(
-            pa.binary(row_bytes), self.n, [None, packed_buf]
-        )
+        columns = {
+            "packed_indices": pa.FixedSizeBinaryArray.from_buffers(
+                pa.binary(row_bytes), self.n, [None, packed_buf]
+            )
+        }
+        if self.norms is not None:
+            fields.insert(0, pa.field("norms", pa.float32()))
+            columns["norms"] = pa.array(self.norms.tolist(), type=pa.float32())
 
+        schema = pa.schema(fields, metadata=metadata)
         table = pa.table(
-            {"norms": norms_arr, "packed_indices": packed_arr}, schema=schema
+            {f.name: columns[f.name] for f in fields}, schema=schema
         )
         feather.write_feather(table, path)
 
@@ -464,7 +522,10 @@ class PackedVectors:
         )
         row_bytes = packed_nbytes(1, d, bits)
 
-        norms = table.column("norms").to_numpy().astype(np.float32)
+        if "norms" in table.schema.names:
+            norms = table.column("norms").to_numpy().astype(np.float32)
+        else:
+            norms = None  # scalar mode — the column was never written
 
         # Extract packed data from contiguous Arrow buffer
         packed_col = table.column("packed_indices")
@@ -489,6 +550,9 @@ class Quantizer:
     Data-oblivious: Uses a theoretical Lloyd-Max codebook for N(0, 1/d).
     No training data needed. Based on TurboQuant (Zandieh et al., ICLR 2026).
 
+    ``normalize=False`` drops step 1 and quantizes the coordinates
+    themselves — see the ``normalize`` argument below.
+
     Supports **nested bit precision**: encode once at full bit-width,
     then search at any lower precision by right-shifting indices.
     The top k bits of an n-bit code are a valid k-bit code, with
@@ -512,16 +576,65 @@ class Quantizer:
                 the Mojo port via `polarquant --rotation rht`. Requires an
                 even d.
 
-            Both are seed-deterministic and exactly orthogonal. The rotation
-            is part of the encoding: vectors encoded under one CANNOT be
-            decoded under the other, so it must match across encode/decode
-            exactly as `seed` must.
+            "none" — no rotation (the identity). Only sensible together with
+                `normalize=False`, where the caller has already conditioned
+                the coordinates; it makes the code for coordinate *j* an
+                exact, matmul-free function of input coordinate *j*, which
+                is what a hash key wants. See
+                `remex.rotation.identity_rotation`.
+
+            All three are seed-deterministic and exactly orthogonal. The
+            rotation is part of the encoding: vectors encoded under one
+            CANNOT be decoded under another, so it must match across
+            encode/decode exactly as `seed` must.
+
+        normalize: Whether to factor each vector into (unit direction, norm)
+            before quantizing. Default True — the behavior described above,
+            and the only mode that existing `.pq`/`.npz` files use.
+
+            False selects **scalar mode**: quantize the (optionally rotated)
+            coordinates directly with the Lloyd-Max codebook, store no norms
+            at all, and let `scale` declare the coordinate spread. Use it
+            when the codes are the product — exact-match hash keys, joins,
+            bucketing — rather than an approximation of a direction:
+
+            - Unit-norm factorization collapses every constant-direction
+              family (`c * 1_vec` and near-parallel neighbourhoods) onto a
+              single direction code. On isotropic embeddings that is
+              harmless; on enumerated algebraic values it builds
+              mega-buckets, and a join that should take minutes turns into
+              a collision storm.
+            - Scalar mode never casts input to float32 (it works in
+              float64) and stores no float32 norms, so values that would
+              overflow either — `exp(700)` and friends — quantize to the
+              extreme cell instead of to `inf`/`nan`.
+
+            Everything else is unchanged: same Lloyd-Max cell shaping, same
+            Matryoshka nesting (right-shift a code for a coarser one, which
+            is a per-query collision/recall dial), same
+            `(d, bits, seed, rotation)` determinism.
+
+        scale: Coordinate standard deviation the Lloyd-Max codebook is built
+            for. Scalar mode only; the normalizing path derives it from the
+            unit sphere as `1/sqrt(d)` and rejects an explicit value.
+            Defaults to 1.0, i.e. inputs assumed roughly N(0, 1).
+
+            remex stays data-oblivious here: it will not measure your data
+            to pick a scale. Condition the input yourself — bound it, or
+            push heavy tails through `arcsinh`/`log` — and set `scale` to
+            the spread you conditioned it to. Coordinates far outside
+            `±3*scale` all land in the outermost cell.
     """
 
-    ROTATIONS = {"haar": haar_rotation, "rht": rht_rotation}
+    ROTATIONS = {
+        "haar": haar_rotation,
+        "rht": rht_rotation,
+        "none": identity_rotation,
+    }
 
     def __init__(self, d: int, bits: int = 4, seed: int = 42,
-                 rotation: str = "haar"):
+                 rotation: str = "haar", normalize: bool = True,
+                 scale: Optional[float] = None):
         if bits < 1 or bits > 8:
             raise ValueError(f"bits must be 1-4 or 8, got {bits}")
         if bits in (5, 6, 7):
@@ -536,16 +649,30 @@ class Quantizer:
                 f"got {rotation!r}"
             )
 
+        normalize = bool(normalize)
+        if normalize and scale is not None:
+            raise ValueError(
+                "scale is only meaningful with normalize=False. The "
+                "normalizing path quantizes unit vectors, whose rotated "
+                "coordinates have a known spread of 1/sqrt(d) — passing a "
+                "scale there would be silently ignored."
+            )
+        # None here means "unit sphere, 1/sqrt(d)"; scalar mode has no such
+        # default to fall back on, so it names one.
+        sigma = None if normalize else (1.0 if scale is None else scale)
+
         self.d = d
         self.bits = bits
         self.seed = seed
         self.rotation = rotation
+        self.normalize = normalize
+        self.scale = coordinate_sigma(d, sigma)
 
         self.R = self.ROTATIONS[rotation](d, seed)
-        self.boundaries, self.centroids = lloyd_max_codebook(d, bits)
+        self.boundaries, self.centroids = lloyd_max_codebook(d, bits, sigma=sigma)
 
         # Precompute nested centroid tables for all bit levels <= bits
-        self._nested = nested_codebooks(d, bits)
+        self._nested = nested_codebooks(d, bits, sigma=sigma)
 
     def encode(self, X: np.ndarray) -> CompressedVectors:
         """
@@ -555,8 +682,12 @@ class Quantizer:
             X: (n, d) float array. Need not be unit-normalized.
 
         Returns:
-            CompressedVectors container with indices and norms.
+            CompressedVectors container with indices, and norms unless this
+            is a scalar-mode (``normalize=False``) quantizer.
         """
+        if not self.normalize:
+            return self._encode_scalar(X)
+
         X = np.asarray(X, dtype=np.float32)
         if X.ndim == 1:
             X = X[np.newaxis]
@@ -570,11 +701,59 @@ class Quantizer:
         norms64 = np.sqrt(np.sum(X.astype(np.float64) ** 2, axis=1))
         norms = norms64.astype(np.float32)
         X_unit = X / np.maximum(norms, 1e-8)[:, None]
-        X_rot = X_unit @ self.R.T
+        X_rot = self._rotate_rows(X_unit)
 
         indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
 
         return CompressedVectors(indices, norms, self.d, self.bits, self.rotation)
+
+    def _encode_scalar(self, X: np.ndarray) -> CompressedVectors:
+        """Quantize coordinates directly — no normalization, no norms.
+
+        Stays in float64 throughout. The float32 cast on the normalizing
+        path is there for Mojo `.pq` parity, and it is exactly what
+        overflows on the heavy-tailed inputs this mode exists for; nothing
+        downstream of a scalar-mode code needs that parity.
+        """
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X[np.newaxis]
+        if X.shape[1] != self.d:
+            raise ValueError(f"Expected d={self.d}, got {X.shape[1]}")
+
+        X_rot = self._rotate_rows(X)
+        # searchsorted promotes the float32 boundaries to float64, so an
+        # out-of-range magnitude saturates at the outermost cell instead of
+        # overflowing to inf. NaN sorts above every boundary; it lands in
+        # the top cell rather than raising, which keeps a code well-defined
+        # for every input.
+        indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
+
+        return CompressedVectors(indices, None, self.d, self.bits, self.rotation)
+
+    def _rotate_rows(self, X: np.ndarray) -> np.ndarray:
+        """Apply R to a row-major batch: ``X @ R.T``, identity short-circuited.
+
+        Skipping the multiply is not just a speed-up. With `rotation="none"`
+        a code becomes a pure `searchsorted` of the input value, with no
+        floating-point summation in between, so identical inputs give
+        identical codes across BLAS builds and thread counts.
+        """
+        if self.rotation == "none":
+            return X
+        return X @ self.R.T
+
+    def _rotate_query(self, q: np.ndarray) -> np.ndarray:
+        """Apply R to a single query vector: ``R @ q``, identity short-circuited."""
+        if self.rotation == "none":
+            return q
+        return self.R @ q
+
+    def _unrotate_rows(self, X_rot: np.ndarray) -> np.ndarray:
+        """Undo ``_rotate_rows``: ``X_rot @ R`` (R orthogonal, so R.T is R^-1)."""
+        if self.rotation == "none":
+            return X_rot
+        return X_rot @ self.R
 
     def _check_rotation(self, compressed) -> None:
         """Refuse to interpret codes a different rotation encoded.
@@ -597,6 +776,31 @@ class Quantizer:
                 f"vectors that are wrong — the two disagree on about half "
                 f"of all stored bits.)"
             )
+        self._check_mode(compressed)
+
+    def _check_mode(self, compressed) -> None:
+        """Refuse to interpret codes the other mode wrote.
+
+        Whether a container carries norms says which mode encoded it, and
+        the codebooks differ by a factor of ``scale * sqrt(d)`` — so
+        crossing the two rescales every reconstructed coordinate. Caught
+        here rather than at the first ``None`` dereference, which would
+        only fire on the paths that happen to touch norms.
+        """
+        has_norms = getattr(compressed, "norms", None) is not None
+        if has_norms == self.normalize:
+            return
+        stored, wanted = (
+            ("normalize=True", "normalize=False") if has_norms
+            else ("normalize=False (scalar)", "normalize=True")
+        )
+        raise ValueError(
+            f"mode mismatch: these codes were encoded with {stored} but "
+            f"this Quantizer uses {wanted}. Rebuild the Quantizer with the "
+            f"mode that wrote them — the two use codebooks scaled "
+            f"differently, so the reconstruction would be off by a constant "
+            f"factor across every coordinate."
+        )
 
     def decode(
         self, compressed: CompressedVectors, precision: Optional[int] = None
@@ -616,8 +820,10 @@ class Quantizer:
         indices = self._resolve_indices(compressed, precision)
         X_hat_rot = centroids[indices]
 
-        X_hat_unit = X_hat_rot @ self.R
-        return X_hat_unit * compressed.norms[:, None]
+        X_hat = self._unrotate_rows(X_hat_rot)
+        if compressed.norms is None:  # scalar mode — coordinates are the code
+            return X_hat
+        return X_hat * compressed.norms[:, None]
 
     def search(
         self,
@@ -656,10 +862,10 @@ class Quantizer:
             )
         self._check_rotation(compressed)
         query = np.asarray(query, dtype=np.float32)
-        q_rot = self.R @ query
+        q_rot = self._rotate_query(query)
 
         X_hat_rot = self._get_x_hat_rot(compressed, precision)
-        scores = (X_hat_rot @ q_rot) * compressed.norms
+        scores = _apply_norms(X_hat_rot @ q_rot, compressed.norms)
 
         if k >= compressed.n:
             topk_idx = np.argsort(-scores)
@@ -701,7 +907,7 @@ class Quantizer:
             (indices, scores): top-k corpus indices and approximate scores.
         """
         query = np.asarray(query, dtype=np.float32)
-        q_rot = self.R @ query
+        q_rot = self._rotate_query(query)
 
         centroids = self._resolve_centroids(compressed, precision)
         table = np.outer(q_rot, centroids).astype(np.float32)
@@ -768,7 +974,7 @@ class Quantizer:
             coarse_precision = max(1, self.bits - 2)
 
         query = np.asarray(query, dtype=np.float32)
-        q_rot = self.R @ query
+        q_rot = self._rotate_query(query)
         coarse_k = min(candidates, compressed.n)
         is_packed = isinstance(compressed, PackedVectors)
 
@@ -801,7 +1007,10 @@ class Quantizer:
 
         X_hat_cand = fine_centroids[fine_indices]  # (candidates, d)
 
-        fine_scores = (X_hat_cand @ q_rot) * compressed.norms[coarse_idx]
+        cand_norms = (
+            None if compressed.norms is None else compressed.norms[coarse_idx]
+        )
+        fine_scores = _apply_norms(X_hat_cand @ q_rot, cand_norms)
         rerank_order = np.argsort(-fine_scores)[:k]
 
         original_idx = coarse_idx[rerank_order]
@@ -845,11 +1054,15 @@ class Quantizer:
             queries = queries[np.newaxis]
 
         n_queries = queries.shape[0]
-        Q_rot = queries @ self.R.T  # (n_queries, d)
+        Q_rot = self._rotate_rows(queries)  # (n_queries, d)
 
         X_hat_rot = self._get_x_hat_rot(compressed, precision)
         # (n_queries, n) = (n_queries, d) @ (d, n)
-        all_scores = (Q_rot @ X_hat_rot.T) * compressed.norms[np.newaxis, :]
+        batch_norms = (
+            None if compressed.norms is None
+            else compressed.norms[np.newaxis, :]
+        )
+        all_scores = _apply_norms(Q_rot @ X_hat_rot.T, batch_norms)
 
         all_indices = np.empty((n_queries, min(k, compressed.n)), dtype=np.intp)
         all_topk_scores = np.empty((n_queries, min(k, compressed.n)), dtype=np.float32)
@@ -870,9 +1083,11 @@ class Quantizer:
         """Compute mean per-vector reconstruction MSE (L2 squared)."""
         compressed = self.encode(X)
         X_hat = self.decode(compressed, precision=precision)
-        return float(
-            np.mean(np.sum((np.asarray(X, np.float32) - X_hat) ** 2, axis=1))
-        )
+        dtype = np.float32 if self.normalize else np.float64
+        X_ref = np.asarray(X, dtype)
+        if X_ref.ndim == 1:
+            X_ref = X_ref[np.newaxis]
+        return float(np.mean(np.sum((X_ref - X_hat) ** 2, axis=1)))
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -882,7 +1097,7 @@ class Quantizer:
     def _adc_score_chunked(
         table: np.ndarray,
         indices: np.ndarray,
-        norms: np.ndarray,
+        norms: Optional[np.ndarray],
         chunk_size: int,
     ) -> np.ndarray:
         """Score vectors via ADC lookup table, processing in chunks.
@@ -890,7 +1105,7 @@ class Quantizer:
         Args:
             table: (d, n_levels) float32 lookup table.
             indices: (n, d) uint8 quantization indices.
-            norms: (n,) float32 vector norms.
+            norms: (n,) float32 vector norms, or None in scalar mode.
             chunk_size: Rows per chunk (controls peak memory).
 
         Returns:
@@ -899,7 +1114,7 @@ class Quantizer:
         Memory: peak allocation is chunk_size * d * 4 bytes.
         At chunk_size=4096, d=384: ~6 MB temporary.
         """
-        n = len(norms)
+        n = indices.shape[0]
         d = table.shape[0]
         dim_idx = np.arange(d)
         scores = np.empty(n, dtype=np.float32)
@@ -910,7 +1125,8 @@ class Quantizer:
             # Gather: table[j, chunk_idx[i, j]] → (chunk, d) float32
             # Then sum over d → (chunk,) inner-product contribution
             chunk_scores = table[dim_idx, chunk_idx].sum(axis=1)
-            scores[start:end] = chunk_scores * norms[start:end]
+            chunk_norms = None if norms is None else norms[start:end]
+            scores[start:end] = _apply_norms(chunk_scores, chunk_norms)
 
         return scores
 
@@ -943,7 +1159,10 @@ class Quantizer:
             if shift > 0:
                 chunk_idx = chunk_idx >> shift
             chunk_scores = table[dim_idx, chunk_idx].sum(axis=1)
-            scores[start:end] = chunk_scores * packed.norms[start:end]
+            chunk_norms = (
+                None if packed.norms is None else packed.norms[start:end]
+            )
+            scores[start:end] = _apply_norms(chunk_scores, chunk_norms)
 
         return scores
 

@@ -4,7 +4,7 @@
 
 **remex** (formerly polar-embed) is a Python library for retrieval-validated embedding compression. It implements random orthogonal rotation + Lloyd-Max scalar quantization (from TurboQuant, Zandieh et al. ICLR 2026) to compress embedding vectors 2-16x with measured recall, optimized for nearest-neighbor retrieval in RAG systems.
 
-Key differentiator: **data-oblivious** — no training required. The quantizer is fully determined by `(dimension, bits, seed, rotation)`.
+Key differentiator: **data-oblivious** — no training required. The quantizer is fully determined by `(dimension, bits, seed, rotation, normalize, scale)`.
 
 ## Architecture
 
@@ -15,7 +15,7 @@ remex/
 ├── codebook.py       # Lloyd-Max codebooks + Matryoshka nested tables
 ├── ivf.py            # IVFCoarseIndex — coarse-tier IVF, data-oblivious
 ├── packing.py        # Bit-packing for sub-byte storage (1-8 bit)
-├── rotation.py       # Haar random orthogonal rotation via QR
+├── rotation.py       # Haar (QR), randomized Hadamard, and the identity
 └── gpu.py            # Optional GPU backend (CuPy/PyTorch/NumPy)
 
 tests/
@@ -24,7 +24,8 @@ tests/
 ├── test_adc_gpu.py       # ADC search, memory accounting, GPUSearcher (numpy fallback)
 ├── test_ivf.py           # IVFCoarseIndex: cell ID, multi-probe, recall, packed interop
 ├── test_packed_vectors.py # PackedVectors creation, unpacking, ADC, serialization
-└── test_coverage_gaps.py  # Edge cases, save/load all bits, subset search
+├── test_coverage_gaps.py  # Edge cases, save/load all bits, subset search
+└── test_scalar_mode.py   # normalize=False: hash-key properties, rotation="none", mode guard
 
 bench/
 ├── benchmark.py          # Self-contained benchmark (no external deps)
@@ -46,6 +47,15 @@ Search:
     → score via matmul (cached dequant) or ADC (lookup table over indices)
     → top-k selection
 ```
+
+**Scalar mode** (`Quantizer(normalize=False)`) drops the first step and the
+norms with it — codes are Lloyd-Max indices of the raw coordinates, cut for
+a caller-declared `scale` instead of the unit sphere's `1/sqrt(d)`, in
+float64 rather than float32. It exists for use cases where the codes *are*
+the product (exact-match hash keys, joins, bucketing) rather than an
+approximation of a direction; `rotation="none"` pairs with it to make a code
+a bare `searchsorted`. `norms is None` is what every container and
+serializer uses to record the mode, and mixing modes raises.
 
 ### Three search strategies
 
@@ -98,13 +108,16 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
 ## Code conventions
 
 - **NumPy-only core**: No PyTorch/CuPy dependency in `remex/core.py`. GPU support is opt-in via `remex/gpu.py`.
-- **No training**: Fully data-oblivious. The quantizer is determined by `(d, bits, seed, rotation)` alone.
+- **No training**: Fully data-oblivious. The quantizer is determined by `(d, bits, seed, rotation, normalize, scale)` alone. Scalar mode keeps this: `scale` is a value the caller *declares*, never one remex measures off the data.
 - **The rotation is part of the encoding**: every persisted container (`.pq` byte 17, `.npz` `rotation` key,
   Arrow `b"rotation"` metadata) records which rotation wrote it, and an absent record means `"haar"` — the
   frozen historical value, never the live default. That rule is what makes the default safe to change; see
   `bench/gates/rotation_identity_gate.py`.
+- **So is the mode**: a scalar-mode container (`normalize=False`) has `norms is None`, and every serializer
+  records that by *omitting* the norms column (`.npz`/Arrow) or setting the no-norms flag (`.pq` byte 18,
+  bit 0). Decoding or searching across the two modes raises, like a rotation mismatch.
 - **Honest compression**: `nbytes` property uses bit-packed sizes, not uint8. Benchmark tables report packed compression ratios.
-- **Deterministic**: Same `(d, bits, seed)` must produce identical results across runs.
+- **Deterministic**: Same `(d, bits, seed)` must produce identical results across runs. `rotation="none"` strengthens this to bit-identical across BLAS builds, because no matmul enters the encoding.
 - **Test thresholds**: Recall tests use conservative bounds (e.g. 2-bit R@10 >= 0.3, not exact values) because recall depends on random data.
 
 ## Key design decisions

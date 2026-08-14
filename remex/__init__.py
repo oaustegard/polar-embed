@@ -15,7 +15,9 @@ Formerly known as polar-embed.
 import warnings
 
 from remex.core import Quantizer, CompressedVectors, PackedVectors
-from remex.codebook import lloyd_max_codebook, nested_codebooks
+from remex.codebook import (
+    coordinate_sigma, lloyd_max_codebook, nested_codebooks,
+)
 from remex.ivf import IVFCoarseIndex
 from remex.packing import pack, unpack, packed_nbytes
 from remex.pq_format import save_pq, load_pq, save_params
@@ -30,7 +32,7 @@ __all__ = [
     "Quantizer", "CompressedVectors", "PackedVectors",
     "PolarQuantizer",  # deprecated alias
     "IVFCoarseIndex",
-    "lloyd_max_codebook", "nested_codebooks",
+    "coordinate_sigma", "lloyd_max_codebook", "nested_codebooks",
     "pack", "unpack", "packed_nbytes",
     "save_pq", "load_pq", "save_params",
 ]

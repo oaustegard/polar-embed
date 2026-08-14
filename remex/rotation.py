@@ -28,7 +28,12 @@ LEGACY_ROTATION = "haar"
 #: lives in were already zero-filled in every file written before the field
 #: existed — so an old file decodes to ``LEGACY_ROTATION`` for free, with no
 #: "is the field present?" branch.
-ROTATION_CODES = {"haar": 0, "rht": 1}
+#:
+#: ``"none"`` is the identity — no rotation at all. It exists for
+#: ``Quantizer(normalize=False)``, where the caller has already conditioned
+#: the coordinate distribution and wants codes that are an exact,
+#: matmul-free function of the input (see ``identity_rotation``).
+ROTATION_CODES = {"haar": 0, "rht": 1, "none": 2}
 ROTATION_BY_CODE = {code: name for name, code in ROTATION_CODES.items()}
 
 
@@ -121,6 +126,35 @@ def haar_rotation(d: int, seed: int = 42) -> np.ndarray:
         Q[:, sign_flip] = -Q[:, sign_flip]
 
     return Q.astype(np.float32)
+
+
+def identity_rotation(d: int, seed: int = 42) -> np.ndarray:
+    """The (d, d) identity — ``rotation="none"``, i.e. no rotation at all.
+
+    Same signature as the real rotations so it drops into
+    ``Quantizer.ROTATIONS`` unchanged; ``seed`` is accepted and ignored,
+    because there is nothing random to seed.
+
+    Quantizing without a rotation gives up the property the rotation exists
+    for — that coordinates become approximately i.i.d. Gaussian, which is
+    what makes one data-oblivious Lloyd-Max codebook right for all of them.
+    It buys back two things that matter for the scalar/hash-key mode
+    (``Quantizer(normalize=False)``):
+
+    - **Exactness.** ``Quantizer`` skips the matmul entirely when R is the
+      identity, so a code is a pure ``searchsorted`` of the input value. No
+      floating-point summation order enters the encoding, so identical
+      inputs give identical codes across BLAS builds and thread counts, not
+      just within one process — which is the contract a hash key needs.
+    - **Interpretability.** Coordinate *j* of the code depends only on
+      coordinate *j* of the input, so a per-coordinate range argument
+      (bounded values, an ``arcsinh`` pre-transform) carries straight
+      through to the codes.
+
+    Use it when the caller has already conditioned each coordinate to a
+    comparable scale. Prefer ``"haar"`` or ``"rht"`` otherwise.
+    """
+    return np.eye(d, dtype=np.float32)
 
 
 def _fwht_inplace(y: np.ndarray) -> None:

@@ -290,7 +290,12 @@ class GPUSearcher:
 
         # Move static data to device
         self._R = self.ops.to_device(quantizer.R.astype(np.float32))
-        self._norms = self.ops.to_device(compressed.norms)
+        # None in scalar mode (Quantizer(normalize=False)) — there are no
+        # norms to move, and scoring skips the rescale entirely.
+        self._norms = (
+            None if compressed.norms is None
+            else self.ops.to_device(compressed.norms)
+        )
 
         # Indices: keep as int type appropriate for backend
         if self.backend_name == "torch":
@@ -325,7 +330,7 @@ class GPUSearcher:
         idx_bytes = self._n * self._d  # uint8 or int64
         if self.backend_name == "torch":
             idx_bytes *= 8  # int64
-        norm_bytes = self._n * 4
+        norm_bytes = 0 if self._norms is None else self._n * 4
         R_bytes = self._d * self._d * 4
         cent_bytes = sum(
             len(c) * 4 if hasattr(c, '__len__') else 0
@@ -353,7 +358,7 @@ class GPUSearcher:
         if self._x_hat_rot_gpu is None:
             self._x_hat_rot_gpu = self._build_x_hat_rot()
 
-        scores = ops.matvec(self._x_hat_rot_gpu, q_rot) * self._norms
+        scores = self._scale(ops.matvec(self._x_hat_rot_gpu, q_rot))
         idx, vals = ops.topk(scores, k)
         return ops.to_numpy(idx), ops.to_numpy(vals)
 
@@ -380,7 +385,9 @@ class GPUSearcher:
         # Build ADC table: (d, n_levels)
         table = ops.xp.outer(q_rot, centroids)
 
-        scores = ops.gather_sum(table, indices, chunk_size=chunk_size) * self._norms
+        scores = self._scale(
+            ops.gather_sum(table, indices, chunk_size=chunk_size)
+        )
         idx, vals = ops.topk(scores, k)
         return ops.to_numpy(idx), ops.to_numpy(vals)
 
@@ -412,9 +419,11 @@ class GPUSearcher:
         coarse_centroids, coarse_indices = self._resolve_gpu(coarse_precision)
         coarse_table = ops.xp.outer(q_rot, coarse_centroids)
 
-        coarse_scores = ops.gather_sum(
-            coarse_table, coarse_indices, chunk_size=coarse_chunk_size
-        ) * self._norms
+        coarse_scores = self._scale(
+            ops.gather_sum(
+                coarse_table, coarse_indices, chunk_size=coarse_chunk_size
+            )
+        )
 
         # Top candidates (no sort needed, just partition)
         coarse_idx, _ = ops.topk(coarse_scores, coarse_k)
@@ -423,7 +432,9 @@ class GPUSearcher:
         fine_indices = self._indices[coarse_idx]  # (candidates, d)
         X_hat_cand = self._centroids[fine_indices]
 
-        fine_scores = ops.matvec(X_hat_cand, q_rot) * self._norms[coarse_idx]
+        fine_scores = self._scale(
+            ops.matvec(X_hat_cand, q_rot), rows=coarse_idx
+        )
         rerank_idx, rerank_scores = ops.topk(fine_scores, k)
 
         original_idx = coarse_idx[rerank_idx]
@@ -454,10 +465,7 @@ class GPUSearcher:
             self._x_hat_rot_gpu = self._build_x_hat_rot()
 
         # (n_queries, n) = (n_queries, d) @ (n, d).T
-        if self.backend_name == "torch":
-            all_scores = ops.matmul(Q_rot, self._x_hat_rot_gpu.T) * self._norms
-        else:
-            all_scores = ops.matmul(Q_rot, self._x_hat_rot_gpu.T) * self._norms
+        all_scores = self._scale(ops.matmul(Q_rot, self._x_hat_rot_gpu.T))
 
         n_queries = Q.shape[0]
         actual_k = min(k, self._n)
@@ -478,6 +486,17 @@ class GPUSearcher:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _scale(self, scores, rows=None):
+        """Rescale raw quantized scores by the stored norms, if any.
+
+        Scalar-mode codes quantize the coordinates themselves, so the
+        lookup already is the approximate inner product.
+        """
+        if self._norms is None:
+            return scores
+        norms = self._norms if rows is None else self._norms[rows]
+        return scores * norms
 
     def _build_x_hat_rot(self):
         """Dequantize indices to float32 on GPU."""
