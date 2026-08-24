@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from remex.packing import pack, unpack, packed_nbytes
+from remex.packing import SUPPORTED_BITS, pack, unpack, packed_nbytes
 from remex.rotation import (
     ROTATION_CODES, rotation_from_code, validate_rotation,
 )
@@ -173,9 +173,10 @@ def load_pq(path: str | Path) -> "CompressedVectors":
             f"file was written by a newer remex."
         )
     has_norms = not (flags & PQ_FLAG_NO_NORMS)
-    if bits in (5, 6, 7):
+    if bits not in SUPPORTED_BITS:
         raise ValueError(
-            f"bits={bits} is not supported. Use 1-4 or 8 bits."
+            f"bits={bits} is not supported. Use one of "
+            f"{list(SUPPORTED_BITS)}."
         )
 
     expected_packed = packed_nbytes(n, d, bits)
