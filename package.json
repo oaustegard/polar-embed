@@ -1,0 +1,5 @@
+{
+  "devDependencies": {
+    "@danilocampos/coherence": "^0.37.1"
+  }
+}
