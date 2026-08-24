@@ -42,3 +42,25 @@ def test_every_supported_width_is_accepted_by_every_guard(bits):
 def test_every_unsupported_width_is_refused(bits):
     with pytest.raises(ValueError, match="not supported"):
         pack(np.zeros(8, dtype=np.uint8), bits)
+
+
+# totality: ratchet — every one of these widths has written indexes to disk;
+# dropping one silently orphans every file packed at that width
+def test_no_shipped_bit_width_is_ever_removed():
+    """invariant: a bit width that has shipped never leaves SUPPORTED_BITS.
+
+    The complement of the enumeration above. `test_every_supported_width_round_trips`
+    loops whatever the tuple now holds, so removing a width leaves it green over
+    the four that remain.
+
+    refuted: removed 3 from SUPPORTED_BITS and lowered the floor to >= 4, the
+    way a real removal would -> the enumeration, the guard test and the refusal
+    test all stayed green (14 passed) while this went red naming 3. Dropping 3
+    WITHOUT touching the floor is co-detected, because the floor is a
+    cardinality check; it cannot see a member substituted for another.
+    """
+    for shipped in (1, 2, 3, 4, 8):
+        assert shipped in SUPPORTED_BITS, (
+            f"{shipped}-bit left SUPPORTED_BITS; every index packed at that "
+            f"width becomes unreadable"
+        )

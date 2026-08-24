@@ -54,3 +54,24 @@ def test_constructible_and_persistable_rotations_agree():
     for name in ROTATION_CODES:
         assert name in Quantizer.ROTATIONS
         assert rotation_from_code(ROTATION_CODES[name]) == name
+
+
+# totality: ratchet — these three have shipped; one leaving is a compatibility
+# break for every index already on disk, so the list is deliberately by hand
+def test_no_shipped_rotation_is_ever_removed():
+    """invariant: a rotation that has shipped never leaves ROTATION_CODES.
+
+    The complement of the enumeration above, and not a weaker version of it.
+    `test_every_declared_rotation_round_trips` loops whatever the registry now
+    holds, so it is structurally blind to the registry NARROWING: drop a member
+    and the loop simply ranges over fewer of them, green. This pins the floor.
+
+    refuted: substituted "xyz" for "none" in both ROTATION_CODES and
+    Quantizer.ROTATIONS -> the domain floor, the enumeration and the parity
+    check all stayed green (5 passed) while this went red naming 'none'.
+    """
+    for shipped in ("haar", "rht", "none"):
+        assert shipped in ROTATION_CODES, (
+            f"{shipped!r} left ROTATION_CODES; every index written with it "
+            f"decodes under the wrong basis"
+        )
