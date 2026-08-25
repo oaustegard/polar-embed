@@ -14,6 +14,15 @@ Packing ratios:
 
 import numpy as np
 
+#: The bit widths this library packs — the single source of truth for that
+#: domain. It was previously spelled five times as the negative check
+#: ``bits in (5, 6, 7)`` across ``packing.py``, ``core.py`` and
+#: ``pq_format.py``, and twice more as the literal ``[1, 2, 3, 4, 8]`` in the
+#: tests. Five sites held equal by memory is a convention; one exported tuple
+#: the guards and the oracle both read is a contract, and a width added here
+#: without a packing path fails the round-trip oracle by name.
+SUPPORTED_BITS = (1, 2, 3, 4, 8)
+
 
 def pack(indices: np.ndarray, bits: int) -> np.ndarray:
     """
@@ -26,10 +35,11 @@ def pack(indices: np.ndarray, bits: int) -> np.ndarray:
     Returns:
         Packed uint8 byte array.
     """
-    if bits in (5, 6, 7):
+    if bits not in SUPPORTED_BITS:
         raise ValueError(
-            f"Bit width {bits} is not supported. Use 1-4 or 8 bits. "
-            f"5-7 bit widths offer negligible benefit over 4-bit or 8-bit."
+            f"Bit width {bits} is not supported. Use one of "
+            f"{list(SUPPORTED_BITS)}. 5-7 bit widths offer negligible benefit "
+            f"over 4-bit or 8-bit."
         )
     flat = indices.ravel().astype(np.uint8)
     n = len(flat)
@@ -87,10 +97,11 @@ def unpack(packed: np.ndarray, bits: int, n_values: int) -> np.ndarray:
     Returns:
         (n_values,) uint8 array.
     """
-    if bits in (5, 6, 7):
+    if bits not in SUPPORTED_BITS:
         raise ValueError(
-            f"Bit width {bits} is not supported. Use 1-4 or 8 bits. "
-            f"5-7 bit widths offer negligible benefit over 4-bit or 8-bit."
+            f"Bit width {bits} is not supported. Use one of "
+            f"{list(SUPPORTED_BITS)}. 5-7 bit widths offer negligible benefit "
+            f"over 4-bit or 8-bit."
         )
     if bits == 8:
         return packed[:n_values].copy()
@@ -129,9 +140,10 @@ def unpack(packed: np.ndarray, bits: int, n_values: int) -> np.ndarray:
 
 def packed_nbytes(n_values: int, d: int, bits: int) -> int:
     """Compute packed byte count for n_values vectors of dimension d."""
-    if bits in (5, 6, 7):
+    if bits not in SUPPORTED_BITS:
         raise ValueError(
-            f"Bit width {bits} is not supported. Use 1-4 or 8 bits."
+            f"Bit width {bits} is not supported. Use one of "
+            f"{list(SUPPORTED_BITS)}."
         )
     total_values = n_values * d
     if bits == 8:

@@ -5,7 +5,7 @@ from typing import Optional, Tuple, Iterable
 from remex.codebook import (
     coordinate_sigma, lloyd_max_codebook, nested_codebooks,
 )
-from remex.packing import pack, unpack, packed_nbytes
+from remex.packing import SUPPORTED_BITS, pack, unpack, packed_nbytes
 from remex.rotation import (
     LEGACY_ROTATION, haar_rotation, identity_rotation, rht_rotation,
     validate_rotation,
@@ -637,10 +637,11 @@ class Quantizer:
                  scale: Optional[float] = None):
         if bits < 1 or bits > 8:
             raise ValueError(f"bits must be 1-4 or 8, got {bits}")
-        if bits in (5, 6, 7):
+        if bits not in SUPPORTED_BITS:
             raise ValueError(
-                f"bits={bits} is not supported. Use 1-4 or 8 bits. "
-                f"5-7 bit widths offer negligible benefit over 4-bit or 8-bit."
+                f"bits={bits} is not supported. Use one of "
+                f"{list(SUPPORTED_BITS)}. 5-7 bit widths offer negligible "
+                f"benefit over 4-bit or 8-bit."
             )
 
         if rotation not in self.ROTATIONS:
