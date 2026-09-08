@@ -4,6 +4,47 @@
 
 ### Added
 
+- **Reconstruction-length correction — `Quantizer(..., renorm=True)`, on by
+  default** ([#81](https://github.com/oaustegard/remex/issues/81)). remex
+  stores each vector's exact norm and a quantized unit direction, then
+  reconstructs `norms * u_hat`. The decoded direction is not unit length: at
+  2-bit it measures 0.89-0.97 and varies per vector, so every reconstruction
+  came out about 1% off in length, by a different amount each time. That is
+  enough to reorder any two neighbours closer together than 1%. `renorm`
+  divides the length out. It is computed from the codes, so no bytes are
+  stored, no container format changes, and a file written by either setting
+  decodes under the other.
+
+  Measured R@10, before -> after:
+
+  | corpus | 2-bit | 3-bit | 4-bit | 8-bit |
+  |---|---|---|---|---|
+  | all-MiniLM-L6-v2, 10k | 0.502 -> 0.759 | 0.597 -> 0.862 | 0.709 -> 0.919 | 0.971 -> 0.992 |
+  | SPECTER2 broad, 9.5k | 0.517 -> 0.773 | 0.611 -> 0.864 | 0.736 -> 0.917 | 0.974 -> 0.994 |
+  | SPECTER2 narrow, 9.5k | 0.508 -> 0.789 | 0.602 -> 0.869 | 0.718 -> 0.922 | 0.967 -> 0.993 |
+  | synthetic Gaussian, 9.5k | 0.542 -> 0.544 | 0.737 -> 0.739 | 0.858 -> 0.861 | - |
+
+  How tightly packed the corpus is sets the size of the gain, not the size of
+  the bias, which measures the same on Gaussian data as on real embeddings: a
+  1% error only reorders neighbours within 1% of each other. That is why every
+  synthetic benchmark in this repo missed it for six releases. 1-bit is
+  unaffected, because there every decoded direction has the same length and a
+  common factor cannot reorder anything.
+
+  Reconstruction MSE moves the other way at the low bit widths (SPECTER2
+  2-bit 58.3 -> 60.1, 1-bit 176.9 -> 197.6, unchanged from 3-bit up). The
+  correction targets ranking rather than squared error, and `mse()` reports
+  what `decode()` returns, so it reflects that.
+
+  Prior art: RSLM ([arXiv 2608.30384](https://arxiv.org/abs/2608.30384)) makes
+  the same correction and stores an explicit 2-byte scale for it. remex needs
+  no stored scale because it reconstructs the direction before scoring.
+
+- **`bench/norm_correction_eval.py`** — cluster-spread sweep with the
+  correction off and on, plus the cached SPECTER2 partitions under
+  `--specter2`. Reports the median rank-10-to-50 score gap alongside recall,
+  which is the quantity that predicts the gain.
+
 - **Scalar mode — `Quantizer(d, bits, normalize=False, scale=1.0)`**
   ([#77](https://github.com/oaustegard/remex/issues/77)). Quantizes the
   (optionally rotated) coordinates directly with the Lloyd-Max codebook:
@@ -30,6 +71,20 @@
 
 ### Changed
 
+- **`GPUSearcher._scale` takes a `precision` argument** and resolves norms
+  through `Quantizer._effective_norms`, cached per precision on device.
+  `IVFCoarseIndex` scoring does the same. Both previously read
+  `compressed.norms` directly, which diverges from `Quantizer.search` once the
+  correction is on; `tests/test_adc_gpu.py` and `tests/test_ivf.py` catch it.
+- **`Quantizer._adc_score_packed` takes an optional `norms` argument**,
+  defaulting to the container's own, so callers can pass effective norms.
+- **README benchmark tables re-measured.** The real-embedding table now
+  reports `renorm=True`. Its FAISS rows were re-run at the same time on faiss
+  1.15.0: their MSE reproduces the previously published values exactly, their
+  recall does not (0.584 against 0.816 at m=96), so the difference sits in PQ
+  codebook training rather than in the harness. Flagged in the table rather
+  than silently replaced.
+
 - `norms` is now optional on `CompressedVectors` and `PackedVectors`, and its
   absence is how every serializer records scalar mode: no `norms` entry in
   `.npz`, no `norms` column in Arrow, and a no-norms flag at `.pq` byte 18
@@ -44,8 +99,15 @@
   codebooks differ by a factor of `scale * sqrt(d)`, so crossing them would
   otherwise rescale every reconstructed coordinate.
 
-The default path is untouched: same codes, same files, same
-`(d, bits, seed, rotation)` determinism.
+Scalar mode leaves the default path untouched: same codes, same files, same
+`(d, bits, seed, rotation)` determinism. The reconstruction-length correction
+above does change default *scoring*, though not the codes or the files.
+
+### Known gaps
+
+- The Mojo port (`mojo/src/quantizer.mojo`) still multiplies raw `norms`, so
+  `polarquant` search diverges from Python search until it carries the same
+  correction. Encode parity is unaffected: the codes are identical either way.
 
 ## v0.6.0 — 2026-08-04
 

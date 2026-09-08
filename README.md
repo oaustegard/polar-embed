@@ -50,7 +50,9 @@ Three steps, each with a clear purpose:
 
 3. **Bit-packing** — Indices are stored at their actual bit width (not wasteful uint8), giving honest compression ratios. A 4-bit codebook uses 4 bits per coordinate on disk.
 
-Norms are stored separately as float32, preserving inner-product ranking up to quantization error.
+4. **Reconstruction-length correction** — Norms are stored separately as float32, but the direction they multiply is a quantized one whose own length is not 1: at 2-bit it measures 0.89-0.97 and varies per vector. Multiplying by the stored norm alone therefore reconstructs a vector about 1% off in length, per vector, which reorders any neighbours closer together than that. `renorm=True` (the default) divides the length out. It is read off the codes, so nothing extra is stored and no format changes; pass `renorm=False` to reproduce the previous behaviour.
+
+   The gain is set by how tightly packed the corpus is rather than by the size of the bias, which measures the same on Gaussian data as on real embeddings. On all-MiniLM-L6-v2 it is worth +0.21 R@10 at 4-bit; on isotropic Gaussian vectors it is worth nothing. See [`bench/norm_correction_eval.py`](bench/norm_correction_eval.py).
 
 **Why not QJL?** TurboQuant includes a QJL (quantized [Johnson-Lindenstrauss](https://en.wikipedia.org/wiki/Johnson%E2%80%93Lindenstrauss_lemma)) residual correction stage for unbiased inner product estimation. We omit it because QJL adds variance that hurts retrieval — when only ranking order matters (not absolute scores), the MSE-optimal rotation + Lloyd-Max stage empirically dominates.
 
@@ -90,12 +92,21 @@ The nesting incurs a small penalty vs independently optimized codebooks: ~1.2% a
 
 | Method | Compression | MSE | R@10 | R@100 |
 |--------|------------|-----|------|-------|
-| remex 8-bit | 2.0x | 0.0000 | 0.974 | 0.995 |
-| remex 4-bit | 7.8x | 0.0093 | 0.707 | 0.932 |
-| remex 3-bit | 10.4x | 0.0341 | 0.599 | 0.897 |
-| remex 2-bit | 16x | 0.1164 | 0.517 | 0.860 |
-| FAISS PQ (m=96, trained) | 16x | 0.0341 | 0.816 | 0.946 |
-| FAISS PQ (m=48, trained) | 32x | 0.0636 | 0.618 | 0.877 |
+| remex 8-bit | 4.0x | 0.0001 | 0.992 | 0.998 |
+| remex 4-bit | 7.8x | 0.0097 | 0.919 | 0.977 |
+| remex 3-bit | 10.4x | 0.0351 | 0.862 | 0.958 |
+| remex 2-bit | 15.4x | 0.1218 | 0.759 | 0.928 |
+| remex 1-bit | 29.5x | 0.4050 | 0.635 | 0.880 |
+| FAISS PQ (m=96, 8-bit, trained) | 16.0x | 0.0341 | 0.584 | 0.897 |
+| FAISS PQ (m=48, 8-bit, trained) | 32.0x | 0.0636 | 0.424 | 0.845 |
+
+Re-measured 2026-09-08 with `renorm=True`. Without it the remex rows read
+0.971 / 0.709 / 0.597 / 0.502 / 0.635 at R@10. The FAISS rows were re-run at
+the same time on faiss 1.15.0: their MSE reproduces the previously published
+values exactly, their recall does not (0.584 here against 0.816 before at
+m=96), so the difference is in PQ codebook training rather than in the
+harness. Both FAISS scoring paths — `index.search` and reconstruct-then-score
+— agree with each other here.
 
 ### Scaling with corpus size (synthetic, 4-bit)
 
@@ -119,21 +130,29 @@ Full benchmark details and distribution sensitivity analysis in [`bench/RESULTS.
 
 ### Do not use remex when
 
-- **You need high recall at aggressive compression on real data.** At 4-bit, FAISS PQ (m=96) achieves R@10=0.816 vs remex's 0.707 on real embeddings. Data-adaptive methods exploit structure that data-oblivious methods cannot.
-- **Your embeddings form very tight clusters.** When cluster spread σ < 0.05, 4-bit R@10 drops to 0.53 (from 0.85 at normal spread). Quantization errors flip rankings among near-identical vectors. 8-bit is much more robust (R@10 stays above 0.95).
+- **You need the smallest possible index.** remex spends bits per coordinate, so at a fixed byte budget a trained product quantizer packs more dimensions per byte. remex 4-bit is 196 B/vector against FAISS PQ's 96 B at m=96; the recall comparison above favours remex, but it is not a like-for-like size.
+- **Your embeddings form extremely tight clusters.** Tight neighbourhoods are where quantization error flips rankings. `renorm=True` repairs most of this — at cluster spread σ=0.01 it takes 4-bit R@10 from 0.100 to 0.527 and 8-bit from 0.815 to 0.956 — but σ=0.01 is still the regime where 4-bit is not enough on its own. Go to 8-bit, or rerank.
 - **You need sublinear search at high recall.** The flat scan is exhaustive; `IVFCoarseIndex` (below) gives a sublinear coarse tier but is approximate by construction and earns its keep only above ~10M vectors. For anything more demanding, consider FAISS IVF, HNSW, or similar — remex's compact encoding can feed an external ANN index.
 
-### Distribution sensitivity (10k corpus, 4-bit, varying cluster tightness)
+### Distribution sensitivity (10k corpus, d=384, 200 queries, varying cluster tightness)
 
-| Cluster spread (σ) | 2-bit R@10 | 4-bit R@10 | 8-bit R@10 |
-|-------------------|-----------|-----------|-----------|
-| 0.01 (very tight) | 0.163 | 0.533 | 0.954 |
-| 0.05 | 0.478 | 0.831 | 0.984 |
-| 0.10 | 0.532 | 0.846 | 0.987 |
-| 0.30 (typical) | 0.538 | 0.850 | 0.987 |
-| 1.00 (diffuse) | 0.525 | 0.848 | 0.984 |
+R@10, `renorm=False` → `renorm=True`. The correction is worth most exactly
+where remex was weakest, and nothing where neighbours are already far apart.
 
-**Detection**: If your 4-bit R@10 is significantly below 0.80 on a held-out set, your embeddings likely have tight clusters. Use 8-bit, or switch to a data-adaptive method.
+| Cluster spread (σ) | rank-10→50 score gap | 2-bit | 4-bit | 8-bit |
+|---|---|---|---|---|
+| 0.01 (very tight) | 0.002 | 0.048 → 0.159 | 0.100 → 0.527 | 0.815 → 0.956 |
+| 0.05 | 0.038 | 0.449 → 0.525 | 0.774 → 0.846 | 0.976 → 0.985 |
+| 0.10 | 0.112 | 0.597 → 0.617 | 0.868 → 0.885 | 0.988 → 0.989 |
+| 0.30 (typical) | 0.163 | 0.537 → 0.544 | 0.851 → 0.853 | 0.984 → 0.985 |
+| 1.00 (diffuse) | 0.163 | 0.541 → 0.544 | 0.866 → 0.864 | 0.989 → 0.990 |
+
+The middle column is the median relative score gap between the 10th and 50th
+true neighbour — the distance a ~1% reconstruction-length error has to cross
+to reorder anything. It, not the bit width, predicts the size of the gain.
+
+**Detection**: If your 4-bit R@10 is significantly below 0.80 on a held-out
+set, your embeddings likely have tight clusters. Use 8-bit, or rerank.
 
 ## Compression ratios
 
@@ -152,7 +171,7 @@ In-memory, indices are stored as uint8 for fast search. The `PackedVectors` clas
 
 ## API reference
 
-### `Quantizer(d, bits=4, seed=42, rotation="haar", normalize=True, scale=None)`
+### `Quantizer(d, bits=4, seed=42, rotation="haar", normalize=True, scale=None, renorm=True)`
 
 Main quantizer class (formerly `PolarQuantizer`, which remains available as a deprecated alias).
 
@@ -162,6 +181,7 @@ Main quantizer class (formerly `PolarQuantizer`, which remains available as a de
 - **`rotation`** — `"haar"` (default), `"rht"`, or `"none"` (the identity — see [scalar mode](#scalar-mode-codes-as-hash-keys)). Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
 - **`normalize`** — `True` (default) factors each vector into unit direction plus a stored norm, as described above. `False` selects [scalar mode](#scalar-mode-codes-as-hash-keys): quantize the coordinates directly, store no norms. Also part of the encoding — a mismatch raises.
 - **`scale`** — Scalar mode only (default `1.0`): the coordinate standard deviation the Lloyd-Max cells are cut for. The normalizing path derives it from the unit sphere as `1/sqrt(d)` and rejects an explicit value.
+- **`renorm`** — `True` (default) divides out the decoded direction's length so a reconstruction has the norm that was stored for it. Unlike `rotation` and `normalize` this is *not* part of the encoding: it changes how codes are read, never what they are, so it is not recorded in any container and the same file decodes under either setting. `False` reproduces the previous behaviour. No effect at 1-bit, where every decoded direction has the same length.
 
 #### Methods
 

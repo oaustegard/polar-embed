@@ -4,7 +4,7 @@
 
 **remex** (formerly polar-embed) is a Python library for retrieval-validated embedding compression. It implements random orthogonal rotation + Lloyd-Max scalar quantization (from TurboQuant, Zandieh et al. ICLR 2026) to compress embedding vectors 2-16x with measured recall, optimized for nearest-neighbor retrieval in RAG systems.
 
-Key differentiator: **data-oblivious** — no training required. The quantizer is fully determined by `(dimension, bits, seed, rotation, normalize, scale)`.
+Key differentiator: **data-oblivious** — no training required. The codes a quantizer writes are fully determined by `(dimension, bits, seed, rotation, normalize, scale)`. `renorm` is a seventh constructor argument but deliberately not part of that tuple: it changes how codes are read, not what they are.
 
 ## Architecture
 
@@ -25,11 +25,13 @@ tests/
 ├── test_ivf.py           # IVFCoarseIndex: cell ID, multi-probe, recall, packed interop
 ├── test_packed_vectors.py # PackedVectors creation, unpacking, ADC, serialization
 ├── test_coverage_gaps.py  # Edge cases, save/load all bits, subset search
-└── test_scalar_mode.py   # normalize=False: hash-key properties, rotation="none", mode guard
+├── test_scalar_mode.py   # normalize=False: hash-key properties, rotation="none", mode guard
+└── test_norm_correction.py # renorm: decoded length, per-precision, path agreement, recall
 
 bench/
 ├── benchmark.py          # Self-contained benchmark (no external deps)
 ├── real_embedding_eval.py  # Real embeddings benchmark (needs sentence-transformers, faiss)
+├── norm_correction_eval.py # renorm off/on: cluster-spread sweep + cached SPECTER2
 └── RESULTS.md            # Benchmark results with distribution sensitivity analysis
 ```
 
@@ -97,6 +99,7 @@ pytest tests/test_adc_gpu.py -v  # just ADC/GPU tests, ~30s
 python bench/benchmark.py               # synthetic data, no extra deps
 pip install -e ".[bench]"               # for real embedding benchmarks
 python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cpu
+python bench/norm_correction_eval.py    # renorm off/on; add --specter2 for the cache
 
 # SPECTER2 (allenai/specter2_base, d=768) — encoding the transformer takes
 # ~50 min on CPU per 10k papers. Skip the encode by pulling a precomputed
@@ -129,9 +132,16 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
    - **4-bit**: ~1.2% recall penalty vs an independently-optimized 4-bit codebook.
    - **2-bit**: ~10% recall penalty (worst level — the inner Lloyd-Max boundaries don't align with sign-based partitioning).
 
-3. **ADC for memory efficiency** — The lookup table `(d, 2^bits)` is tiny (~6KB for 2-bit d=384). Chunked scoring keeps temporary allocation at ~6MB regardless of corpus size.
+3. **Reconstruction-length correction (`renorm=True`, default)** — `norms` is the length of the *original* vector, but it multiplies a quantized direction whose own length is not 1 (0.89-0.97 at 2-bit, varying per vector). `Quantizer._direction_lengths` reads that length off the codes and `_effective_norms` divides it out, so nothing is stored and no container format changes. Worth +0.21 R@10 at 4-bit on all-MiniLM-L6-v2 and +0.18 to +0.28 on SPECTER2; worth ~0.000 on isotropic Gaussian data, which is why the synthetic benchmarks never showed it. Nothing at 1-bit, where every decoded direction has the same length.
 
-4. **GPU is a wrapper, not a fork** — `GPUSearcher` wraps `Quantizer + CompressedVectors` rather than replacing them. The core stays pure NumPy.
+   Three things to keep in mind when touching scoring code:
+   - **Every path that multiplies by norms must go through `_effective_norms`.** `core.py` (decode, search, search_adc, search_twostage, search_batch), `ivf.py` and `gpu.py` all do. `tests/test_ivf.py` and `tests/test_adc_gpu.py` assert those paths agree with `Quantizer.search`, so missing one fails loudly rather than silently returning a different ranking.
+   - **It is per precision.** A Matryoshka level has its own centroid table and therefore its own direction lengths; the cache on the container is keyed by precision for that reason.
+   - **The Mojo port does not implement it yet.** `mojo/src/quantizer.mojo` still multiplies raw `norms`, so `polarquant` search diverges from Python search. `.pq` encode parity is unaffected — the codes are identical.
+
+4. **ADC for memory efficiency** — The lookup table `(d, 2^bits)` is tiny (~6KB for 2-bit d=384). Chunked scoring keeps temporary allocation at ~6MB regardless of corpus size.
+
+5. **GPU is a wrapper, not a fork** — `GPUSearcher` wraps `Quantizer + CompressedVectors` rather than replacing them. The core stays pure NumPy.
 
 ## Testing
 
