@@ -357,6 +357,7 @@ class IVFCoarseIndex:
 
         norms = self.quantizer._effective_norms(self.compressed, precision)
         cand_norms = None if norms is None else norms[cand]
+        offset = self.quantizer._query_offset(query)
         d = self.d
         dim_idx = np.arange(d)
         scores = np.empty(n_cand, dtype=np.float32)
@@ -368,7 +369,7 @@ class IVFCoarseIndex:
             scores[start:end] = _apply_norms(
                 chunk_scores,
                 None if cand_norms is None else cand_norms[start:end],
-            )
+            ) + offset
 
         k_eff = min(k, n_cand)
         if k_eff >= n_cand:
@@ -440,7 +441,7 @@ class IVFCoarseIndex:
         fine_scores = _apply_norms(
             X_hat_cand @ q_rot,
             None if norms is None else norms[coarse_idx],
-        )
+        ) + self.quantizer._query_offset(query)
         k_eff = min(k, len(coarse_idx))
         order = np.argsort(-fine_scores)[:k_eff]
         return coarse_idx[order], fine_scores[order]

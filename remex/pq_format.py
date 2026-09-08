@@ -121,6 +121,14 @@ def save_pq(path: str | Path, compressed: "CompressedVectors") -> None:
     writes no norms section. Such a file is readable by ``load_pq`` but not
     yet by the Mojo port.
     """
+    if getattr(compressed, "mean", None) is not None:
+        raise ValueError(
+            "the .pq format cannot carry a centered container yet: it has "
+            "no section for the corpus mean, and a reader that dropped the "
+            "mean would decode every vector shifted. Use .npz or Arrow, "
+            "which both round-trip it."
+        )
+
     n, d, bits = int(compressed.n), int(compressed.d), int(compressed.bits)
     packed = pack(compressed.indices.ravel(), bits)
     expected_packed = packed_nbytes(n, d, bits)

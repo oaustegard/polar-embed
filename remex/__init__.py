@@ -14,7 +14,9 @@ Formerly known as polar-embed.
 
 import warnings
 
-from remex.core import Quantizer, CompressedVectors, PackedVectors
+from remex.core import (
+    Quantizer, CompressedVectors, PackedVectors, corpus_mean,
+)
 from remex.codebook import (
     coordinate_sigma, lloyd_max_codebook, nested_codebooks,
 )
@@ -29,6 +31,7 @@ try:  # resolved from installed metadata, never hardcoded
 except PackageNotFoundError:  # bare source checkout, not installed
     __version__ = "0.0.0+unknown"
 __all__ = [
+    "corpus_mean",
     "Quantizer", "CompressedVectors", "PackedVectors",
     "PolarQuantizer",  # deprecated alias
     "IVFCoarseIndex",

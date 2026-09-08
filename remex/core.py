@@ -17,6 +17,47 @@ def _norms_nbytes(norms: Optional[np.ndarray]) -> int:
     return 0 if norms is None else norms.nbytes
 
 
+def _validate_mean(mean, d: int, normalize: bool, renorm: bool):
+    """Check a caller-declared corpus mean, or pass ``None`` through.
+
+    remex never measures this off the data — the caller declares it, the way
+    it declares ``scale`` in scalar mode. ``remex.corpus_mean`` is the
+    blessed way to compute one.
+    """
+    if mean is None:
+        return None
+    if not normalize:
+        raise ValueError(
+            "mean is only meaningful with normalize=True. Scalar mode "
+            "quantizes the coordinates themselves, so there is no direction "
+            "to take relative to a centre."
+        )
+    if not renorm:
+        raise ValueError(
+            "mean requires renorm=True. Centered codes reconstruct as "
+            "mu + m * u_hat with u_hat a unit direction, and renorm=False "
+            "leaves the decoded direction its raw, non-unit length."
+        )
+    mean = np.asarray(mean, dtype=np.float32)
+    if mean.shape != (d,):
+        raise ValueError(f"mean must have shape ({d},), got {mean.shape}")
+    if not np.all(np.isfinite(mean)):
+        raise ValueError("mean must be finite")
+    return mean
+
+
+def corpus_mean(X: np.ndarray) -> np.ndarray:
+    """The mean of a corpus, as ``Quantizer(mean=...)`` wants it.
+
+    Accumulated in float64 and returned as float32, so the value does not
+    depend on how the rows were chunked.
+    """
+    X = np.asarray(X)
+    if X.ndim != 2:
+        raise ValueError(f"expected a 2-D corpus, got shape {X.shape}")
+    return X.mean(axis=0, dtype=np.float64).astype(np.float32)
+
+
 def _apply_norms(
     scores: np.ndarray, norms: Optional[np.ndarray]
 ) -> np.ndarray:
@@ -41,18 +82,23 @@ class CompressedVectors:
     coordinates and keeps no per-vector norm.
     """
 
-    __slots__ = ("indices", "norms", "d", "bits", "n", "rotation",
+    __slots__ = ("indices", "norms", "d", "bits", "n", "rotation", "mean",
                  "_x_hat_rot", "_dir_len")
 
     def __init__(self, indices: np.ndarray, norms: Optional[np.ndarray],
                  d: int, bits: int,
-                 rotation: str = LEGACY_ROTATION):
+                 rotation: str = LEGACY_ROTATION,
+                 mean: Optional[np.ndarray] = None):
         self.indices = indices  # (n, d) uint8 — unpacked for fast access
         self.norms = norms
         self.d = d
         self.bits = bits
         self.n = indices.shape[0]
         self.rotation = validate_rotation(rotation)
+        #: Corpus mean these codes are relative to, or None for the plain path.
+        #: Part of the encoding the way ``rotation`` is: decoding against a
+        #: different one is refused rather than silently wrong.
+        self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
         self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
         self._dir_len = {}  # precision -> (n,) length of the decoded direction
 
@@ -66,7 +112,7 @@ class CompressedVectors:
         sub = CompressedVectors(
             self.indices[idx],
             None if self.norms is None else self.norms[idx],
-            self.d, self.bits, self.rotation,
+            self.d, self.bits, self.rotation, self.mean,
         )
         if self._x_hat_rot is not None:
             sub._x_hat_rot = self._x_hat_rot[idx]
@@ -110,6 +156,8 @@ class CompressedVectors:
         """
         packed_idx = pack(self.indices.ravel(), self.bits)
         optional = {} if self.norms is None else {"norms": self.norms}
+        if self.mean is not None:
+            optional["mean"] = self.mean
         np.savez_compressed(
             path,
             packed_indices=packed_idx,
@@ -144,7 +192,8 @@ class CompressedVectors:
             indices = data["indices"]
 
         norms = data["norms"] if "norms" in data else None
-        return cls(indices, norms, d, bits, rotation)
+        mean = data["mean"] if "mean" in data else None
+        return cls(indices, norms, d, bits, rotation, mean)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format, packing indices for storage.
@@ -188,7 +237,7 @@ class PackedVectors:
     supported — use ``to_compressed()`` to convert back if needed.
     """
 
-    __slots__ = ("_packed", "norms", "d", "bits", "n", "rotation",
+    __slots__ = ("_packed", "norms", "d", "bits", "n", "rotation", "mean",
                  "_row_bytes", "_row_aligned", "_dir_len")
 
     def __init__(
@@ -199,6 +248,7 @@ class PackedVectors:
         d: int,
         bits: int,
         rotation: str = LEGACY_ROTATION,
+        mean: Optional[np.ndarray] = None,
     ):
         """
         Args:
@@ -217,6 +267,7 @@ class PackedVectors:
         self.d = d
         self.bits = bits
         self.rotation = validate_rotation(rotation)
+        self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
         self._row_bytes = packed_nbytes(1, d, bits)
         self._row_aligned = (d * bits) % 8 == 0
         self._dir_len = {}  # precision -> (n,) length of the decoded direction
@@ -289,7 +340,8 @@ class PackedVectors:
             for i in range(n):
                 packed[i] = pack(compressed.indices[i], bits)
         norms = None if compressed.norms is None else compressed.norms.copy()
-        return cls(packed, norms, n, d, bits, compressed.rotation)
+        mean = None if compressed.mean is None else compressed.mean.copy()
+        return cls(packed, norms, n, d, bits, compressed.rotation, mean)
 
     @classmethod
     def from_rows(
@@ -367,14 +419,15 @@ class PackedVectors:
 
         return PackedVectors(
             packed_target, self._copy_norms(), self.n, self.d, target_bits,
-            self.rotation,
+            self.rotation, None if self.mean is None else self.mean.copy(),
         )
 
     def to_compressed(self) -> CompressedVectors:
         """Convert to CompressedVectors by unpacking all indices."""
         indices = self.unpack_rows(0, self.n)
         return CompressedVectors(
-            indices, self._copy_norms(), self.d, self.bits, self.rotation
+            indices, self._copy_norms(), self.d, self.bits, self.rotation,
+            None if self.mean is None else self.mean.copy(),
         )
 
     def subset(self, idx: np.ndarray) -> "PackedVectors":
@@ -387,6 +440,7 @@ class PackedVectors:
             self.d,
             self.bits,
             self.rotation,
+            None if self.mean is None else self.mean.copy(),
         )
 
     def _copy_norms(self) -> Optional[np.ndarray]:
@@ -414,6 +468,8 @@ class PackedVectors:
         no ``norms`` entry.
         """
         optional = {} if self.norms is None else {"norms": self.norms}
+        if self.mean is not None:
+            optional["mean"] = self.mean
         np.savez_compressed(
             path,
             packed_indices=self._packed.ravel(),
@@ -440,7 +496,8 @@ class PackedVectors:
         packed_flat = data["packed_indices"]
         packed = packed_flat.reshape(n, row_bytes)
         norms = data["norms"] if "norms" in data else None
-        return cls(packed, norms, n, d, bits, rotation)
+        mean = data["mean"] if "mean" in data else None
+        return cls(packed, norms, n, d, bits, rotation, mean)
 
     def save_arrow(self, path: str, seed: Optional[int] = None, **extra_metadata):
         """Save to Arrow IPC (Feather v2) format.
@@ -638,7 +695,8 @@ class Quantizer:
 
     def __init__(self, d: int, bits: int = 4, seed: int = 42,
                  rotation: str = "haar", normalize: bool = True,
-                 scale: Optional[float] = None, renorm: bool = True):
+                 scale: Optional[float] = None, renorm: bool = True,
+                 mean: Optional[np.ndarray] = None):
         if bits < 1 or bits > 8:
             raise ValueError(f"bits must be 1-4 or 8, got {bits}")
         if bits not in SUPPORTED_BITS:
@@ -672,6 +730,7 @@ class Quantizer:
         self.rotation = rotation
         self.normalize = normalize
         self.renorm = bool(renorm)
+        self.mean = _validate_mean(mean, d, normalize, self.renorm)
         self.scale = coordinate_sigma(d, sigma)
 
         self.R = self.ROTATIONS[rotation](d, seed)
@@ -706,12 +765,55 @@ class Quantizer:
         # with the Mojo encoder.
         norms64 = np.sqrt(np.sum(X.astype(np.float64) ** 2, axis=1))
         norms = norms64.astype(np.float32)
-        X_unit = X / np.maximum(norms, 1e-8)[:, None]
+
+        target = X if self.mean is None else X - self.mean
+        if self.mean is None:
+            lengths = norms
+        else:
+            lengths = np.sqrt(
+                np.sum(target.astype(np.float64) ** 2, axis=1)
+            ).astype(np.float32)
+
+        X_unit = target / np.maximum(lengths, 1e-8)[:, None]
         X_rot = self._rotate_rows(X_unit)
 
         indices = np.searchsorted(self.boundaries, X_rot).astype(np.uint8)
 
-        return CompressedVectors(indices, norms, self.d, self.bits, self.rotation)
+        if self.mean is None:
+            return CompressedVectors(
+                indices, norms, self.d, self.bits, self.rotation
+            )
+        return CompressedVectors(
+            indices, self._centred_lengths(indices, norms64, lengths),
+            self.d, self.bits, self.rotation, self.mean,
+        )
+
+    def _centred_lengths(self, indices, norms64, fallback):
+        """How far along the decoded direction to land so the reconstruction
+        has the original vector's length.
+
+        A centred code decodes to ``mu + m * u_hat``. Choosing ``m`` to solve
+        ``||mu + m*u_hat|| == ||x||`` puts the whole correction in the norms
+        column the container already has, so a centred index costs no extra
+        bytes per vector. Expanding the norm gives
+        ``m^2 + 2m(mu.u_hat) + (||mu||^2 - ||x||^2) = 0``; the positive root
+        is the one on the ray the code points along.
+
+        Where no positive root exists — the original vector is shorter than
+        the mean's distance to that ray, which needs a corpus whose mean
+        dwarfs its spread — the residual's own length is kept instead, which
+        is what an uncentred code would have stored.
+        """
+        u_rot = self.centroids[indices]
+        u = self._unrotate_rows(u_rot).astype(np.float64)
+        u /= np.maximum(np.linalg.norm(u, axis=1), 1e-12)[:, None]
+
+        mu = self.mean.astype(np.float64)
+        b = u @ mu
+        c = float(mu @ mu) - norms64 ** 2
+        disc = b * b - c
+        m = np.where(disc > 0.0, -b + np.sqrt(np.maximum(disc, 0.0)), fallback)
+        return m.astype(np.float32)
 
     def _encode_scalar(self, X: np.ndarray) -> CompressedVectors:
         """Quantize coordinates directly — no normalization, no norms.
@@ -784,6 +886,32 @@ class Quantizer:
             )
         self._check_mode(compressed)
 
+    def _check_mean(self, compressed) -> None:
+        """Refuse to interpret codes written against a different centre.
+
+        A centred code is meaningless without its mean and an uncentred one
+        is wrong with it, so this is the same class of mismatch as
+        ``rotation`` and is refused the same way rather than returning
+        vectors that look plausible.
+        """
+        stored = getattr(compressed, "mean", None)
+        if stored is None and self.mean is None:
+            return
+        if stored is None or self.mean is None:
+            which = "no mean" if stored is None else "a corpus mean"
+            want = "a corpus mean" if stored is None else "no mean"
+            raise ValueError(
+                f"mean mismatch: these codes were encoded with {which} but "
+                f"this Quantizer uses {want}. Rebuild the Quantizer with the "
+                f"mean that wrote them."
+            )
+        if not np.allclose(stored, self.mean, rtol=1e-5, atol=1e-6):
+            raise ValueError(
+                "mean mismatch: these codes were encoded against a different "
+                "corpus mean. Decoding against this one would shift every "
+                "reconstructed vector by the difference."
+            )
+
     def _check_mode(self, compressed) -> None:
         """Refuse to interpret codes the other mode wrote.
 
@@ -807,6 +935,17 @@ class Quantizer:
             f"differently, so the reconstruction would be off by a constant "
             f"factor across every coordinate."
         )
+
+    def _query_offset(self, query: np.ndarray) -> float:
+        """``q . mu``, the part of a centred score that does not vary by row.
+
+        Constant across the corpus for a given query, so it cannot reorder
+        anything; it is added anyway so the scores a search returns match
+        the inner products against ``decode()``.
+        """
+        if self.mean is None:
+            return 0.0
+        return float(np.asarray(query, dtype=np.float32) @ self.mean)
 
     def _direction_lengths(
         self, compressed, precision: Optional[int] = None
@@ -888,7 +1027,10 @@ class Quantizer:
         X_hat = self._unrotate_rows(X_hat_rot)
         if compressed.norms is None:  # scalar mode — coordinates are the code
             return X_hat
-        return X_hat * self._effective_norms(compressed, precision)[:, None]
+        X_hat = X_hat * self._effective_norms(compressed, precision)[:, None]
+        if self.mean is not None:
+            X_hat = X_hat + self.mean
+        return X_hat
 
     def search(
         self,
@@ -932,7 +1074,7 @@ class Quantizer:
         X_hat_rot = self._get_x_hat_rot(compressed, precision)
         scores = _apply_norms(
             X_hat_rot @ q_rot, self._effective_norms(compressed, precision)
-        )
+        ) + self._query_offset(query)
 
         if k >= compressed.n:
             topk_idx = np.argsort(-scores)
@@ -991,6 +1133,8 @@ class Quantizer:
                 table, indices,
                 self._effective_norms(compressed, precision), chunk_size
             )
+
+        scores = scores + self._query_offset(query)
 
         if k >= compressed.n:
             topk_idx = np.argsort(-scores)
@@ -1081,7 +1225,7 @@ class Quantizer:
 
         fine_norms = self._effective_norms(compressed, None)
         cand_norms = None if fine_norms is None else fine_norms[coarse_idx]
-        fine_scores = _apply_norms(X_hat_cand @ q_rot, cand_norms)
+        fine_scores = _apply_norms(X_hat_cand @ q_rot, cand_norms) + self._query_offset(query)
         rerank_order = np.argsort(-fine_scores)[:k]
 
         original_idx = coarse_idx[rerank_order]
@@ -1132,6 +1276,10 @@ class Quantizer:
         eff = self._effective_norms(compressed, precision)
         batch_norms = None if eff is None else eff[np.newaxis, :]
         all_scores = _apply_norms(Q_rot @ X_hat_rot.T, batch_norms)
+        if self.mean is not None:
+            all_scores = all_scores + (
+                np.asarray(queries, dtype=np.float32) @ self.mean
+            )[:, None]
 
         all_indices = np.empty((n_queries, min(k, compressed.n)), dtype=np.intp)
         all_topk_scores = np.empty((n_queries, min(k, compressed.n)), dtype=np.float32)
@@ -1269,6 +1417,7 @@ class Quantizer:
         one place the rotation invariant has to hold.
         """
         self._check_rotation(compressed)
+        self._check_mean(compressed)
         if precision is None:
             return self.centroids
         if precision < 1 or precision > self.bits:

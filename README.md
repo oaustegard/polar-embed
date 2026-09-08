@@ -50,7 +50,11 @@ Three steps, each with a clear purpose:
 
 3. **Bit-packing** — Indices are stored at their actual bit width (not wasteful uint8), giving honest compression ratios. A 4-bit codebook uses 4 bits per coordinate on disk.
 
-4. **Reconstruction-length correction** — Norms are stored separately as float32, but the direction they multiply is a quantized one whose own length is not 1: at 2-bit it measures 0.89-0.97 and varies per vector. Multiplying by the stored norm alone therefore reconstructs a vector about 1% off in length, per vector, which reorders any neighbours closer together than that. `renorm=True` (the default) divides the length out. It is read off the codes, so nothing extra is stored and no format changes; pass `renorm=False` to reproduce the previous behaviour.
+4. **Optional centering** — `Quantizer(mean=...)` encodes each vector's offset from a corpus mean you supply, and solves for the stored length so the reconstruction keeps the original vector's norm. Both halves are one feature: subtracting a mean and keeping the residual's own length *loses* recall at every bit width. The correction rides in the norms column that already exists, so a centred index costs no extra bytes per vector beyond the one stored mean.
+
+   remex never measures the mean — the caller declares it, the way it declares `scale` in scalar mode — and `remex.corpus_mean(X)` is the blessed way to compute one. Whether it pays depends on how much of your corpus is a shared direction: on SPECTER2 (raw inner product) it is worth +0.03 to +0.08 R@10, on L2-normalised all-MiniLM-L6-v2 +0.005 to +0.018, and on isotropic Gaussian vectors nothing. Measure with [`bench/centered_eval.py`](bench/centered_eval.py) before turning it on.
+
+5. **Reconstruction-length correction** — Norms are stored separately as float32, but the direction they multiply is a quantized one whose own length is not 1: at 2-bit it measures 0.89-0.97 and varies per vector. Multiplying by the stored norm alone therefore reconstructs a vector about 1% off in length, per vector, which reorders any neighbours closer together than that. `renorm=True` (the default) divides the length out. It is read off the codes, so nothing extra is stored and no format changes; pass `renorm=False` to reproduce the previous behaviour.
 
    The gain is set by how tightly packed the corpus is rather than by the size of the bias, which measures the same on Gaussian data as on real embeddings. On all-MiniLM-L6-v2 it is worth +0.21 R@10 at 4-bit; on isotropic Gaussian vectors it is worth nothing. See [`bench/norm_correction_eval.py`](bench/norm_correction_eval.py).
 
@@ -107,6 +111,21 @@ values exactly, their recall does not (0.584 here against 0.816 before at
 m=96), so the difference is in PQ codebook training rather than in the
 harness. Both FAISS scoring paths — `index.search` and reconstruct-then-score
 — agree with each other here.
+
+### Centering (`Quantizer(mean=...)`), R@10 plain → centred
+
+| corpus | ‖mean‖ / mean ‖x‖ | 1-bit | 2-bit | 3-bit | 4-bit | 8-bit |
+|---|---|---|---|---|---|---|
+| SPECTER2 broad, 9.5k, d=768 | 0.92 | 0.637 → 0.686 | 0.773 → 0.852 | 0.864 → 0.913 | 0.917 → 0.949 | 0.994 → 0.996 |
+| SPECTER2 narrow, 9.5k, d=768 | 0.92 | 0.670 → 0.706 | 0.789 → 0.858 | 0.869 → 0.920 | 0.922 → 0.958 | 0.993 → 0.998 |
+| all-MiniLM-L6-v2, 10k, d=384 | 0.51 | 0.635 → 0.609 | 0.759 → 0.777 | 0.862 → 0.868 | 0.919 → 0.924 | 0.992 → 0.992 |
+| synthetic gaussian, 9.5k | 0.01 | 0.258 → 0.254 | 0.540 → 0.542 | 0.732 → 0.728 | 0.860 → 0.858 | 0.990 → 0.989 |
+
+The second column is what predicts the gain: how long the corpus mean is
+against a typical vector. Near zero, centering does nothing. Reproduce with
+`python bench/centered_eval.py --specter2`, which also prints the naive arm —
+subtracting the mean without restoring the full length — that loses 0.03 to
+0.18 R@10 and is why the two halves ship as one feature.
 
 ### Scaling with corpus size (synthetic, 4-bit)
 
@@ -171,7 +190,7 @@ In-memory, indices are stored as uint8 for fast search. The `PackedVectors` clas
 
 ## API reference
 
-### `Quantizer(d, bits=4, seed=42, rotation="haar", normalize=True, scale=None, renorm=True)`
+### `Quantizer(d, bits=4, seed=42, rotation="haar", normalize=True, scale=None, renorm=True, mean=None)`
 
 Main quantizer class (formerly `PolarQuantizer`, which remains available as a deprecated alias).
 
@@ -181,6 +200,7 @@ Main quantizer class (formerly `PolarQuantizer`, which remains available as a de
 - **`rotation`** — `"haar"` (default), `"rht"`, or `"none"` (the identity — see [scalar mode](#scalar-mode-codes-as-hash-keys)). Part of the encoding exactly as `seed` is: every container records it, a file written before rotations were recorded resolves to `"haar"`, and decoding against the wrong one raises.
 - **`normalize`** — `True` (default) factors each vector into unit direction plus a stored norm, as described above. `False` selects [scalar mode](#scalar-mode-codes-as-hash-keys): quantize the coordinates directly, store no norms. Also part of the encoding — a mismatch raises.
 - **`scale`** — Scalar mode only (default `1.0`): the coordinate standard deviation the Lloyd-Max cells are cut for. The normalizing path derives it from the unit sphere as `1/sqrt(d)` and rejects an explicit value.
+- **`mean`** — `None` (default) encodes whole vectors. A `(d,)` array turns on centered mode: codes become offsets from that mean, and the reconstruction is scaled to the original vector's length. Part of the encoding like `rotation` — every container records it and decoding against a different one raises. Requires `renorm=True`, and is rejected in scalar mode. Use `remex.corpus_mean(X)` to compute one; remex will not measure it for you.
 - **`renorm`** — `True` (default) divides out the decoded direction's length so a reconstruction has the norm that was stored for it. Unlike `rotation` and `normalize` this is *not* part of the encoding: it changes how codes are read, never what they are, so it is not recorded in any container and the same file decodes under either setting. `False` reproduces the previous behaviour. No effect at 1-bit, where every decoded direction has the same length.
 
 #### Methods
