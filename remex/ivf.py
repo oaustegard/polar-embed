@@ -355,7 +355,7 @@ class IVFCoarseIndex:
             shift = self.quantizer.bits - precision
             cand_idx = cand_idx >> shift
 
-        norms = self.compressed.norms
+        norms = self.quantizer._effective_norms(self.compressed, precision)
         cand_norms = None if norms is None else norms[cand]
         d = self.d
         dim_idx = np.arange(d)
@@ -436,7 +436,7 @@ class IVFCoarseIndex:
             fine_indices = self.compressed.indices[coarse_idx]
         X_hat_cand = fine_centroids[fine_indices]
 
-        norms = self.compressed.norms
+        norms = self.quantizer._effective_norms(self.compressed, None)
         fine_scores = _apply_norms(
             X_hat_cand @ q_rot,
             None if norms is None else norms[coarse_idx],

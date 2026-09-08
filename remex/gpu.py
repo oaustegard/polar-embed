@@ -292,10 +292,11 @@ class GPUSearcher:
         self._R = self.ops.to_device(quantizer.R.astype(np.float32))
         # None in scalar mode (Quantizer(normalize=False)) — there are no
         # norms to move, and scoring skips the rescale entirely.
-        self._norms = (
-            None if compressed.norms is None
-            else self.ops.to_device(compressed.norms)
-        )
+        # Otherwise these are the quantizer's EFFECTIVE norms, which fold
+        # in the reconstruction-length correction; they differ per
+        # precision, so a Matryoshka level gets its own device copy.
+        self._norm_cache = {}
+        self._norms = self._device_norms(None)
 
         # Indices: keep as int type appropriate for backend
         if self.backend_name == "torch":
@@ -386,7 +387,8 @@ class GPUSearcher:
         table = ops.xp.outer(q_rot, centroids)
 
         scores = self._scale(
-            ops.gather_sum(table, indices, chunk_size=chunk_size)
+            ops.gather_sum(table, indices, chunk_size=chunk_size),
+            precision=precision,
         )
         idx, vals = ops.topk(scores, k)
         return ops.to_numpy(idx), ops.to_numpy(vals)
@@ -422,7 +424,8 @@ class GPUSearcher:
         coarse_scores = self._scale(
             ops.gather_sum(
                 coarse_table, coarse_indices, chunk_size=coarse_chunk_size
-            )
+            ),
+            precision=coarse_precision,
         )
 
         # Top candidates (no sort needed, just partition)
@@ -487,15 +490,32 @@ class GPUSearcher:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _scale(self, scores, rows=None):
-        """Rescale raw quantized scores by the stored norms, if any.
+    def _device_norms(self, precision):
+        """Device copy of the quantizer's effective norms at ``precision``.
+
+        ``None`` in scalar mode. Cached, because the host side walks the
+        codes once per precision to get the decoded direction's length.
+        """
+        if self._compressed.norms is None:
+            return None
+        if precision not in self._norm_cache:
+            host = self._pq._effective_norms(self._compressed, precision)
+            self._norm_cache[precision] = self.ops.to_device(
+                np.asarray(host, dtype=np.float32)
+            )
+        return self._norm_cache[precision]
+
+    def _scale(self, scores, rows=None, precision=None):
+        """Rescale raw quantized scores by the effective norms, if any.
 
         Scalar-mode codes quantize the coordinates themselves, so the
         lookup already is the approximate inner product.
         """
-        if self._norms is None:
+        norms = self._device_norms(precision)
+        if norms is None:
             return scores
-        norms = self._norms if rows is None else self._norms[rows]
+        if rows is not None:
+            norms = norms[rows]
         return scores * norms
 
     def _build_x_hat_rot(self):

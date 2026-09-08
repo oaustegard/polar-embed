@@ -41,7 +41,8 @@ class CompressedVectors:
     coordinates and keeps no per-vector norm.
     """
 
-    __slots__ = ("indices", "norms", "d", "bits", "n", "rotation", "_x_hat_rot")
+    __slots__ = ("indices", "norms", "d", "bits", "n", "rotation",
+                 "_x_hat_rot", "_dir_len")
 
     def __init__(self, indices: np.ndarray, norms: Optional[np.ndarray],
                  d: int, bits: int,
@@ -53,6 +54,7 @@ class CompressedVectors:
         self.n = indices.shape[0]
         self.rotation = validate_rotation(rotation)
         self._x_hat_rot = None  # cached dequantized rotated vectors (full precision)
+        self._dir_len = {}  # precision -> (n,) length of the decoded direction
 
     @property
     def has_norms(self) -> bool:
@@ -96,6 +98,7 @@ class CompressedVectors:
     def drop_cache(self):
         """Free the dequantized float32 cache to reclaim memory."""
         self._x_hat_rot = None
+        self._dir_len = {}
 
     def save(self, path: str):
         """Save to compressed .npz file with bit-packed indices.
@@ -186,7 +189,7 @@ class PackedVectors:
     """
 
     __slots__ = ("_packed", "norms", "d", "bits", "n", "rotation",
-                 "_row_bytes", "_row_aligned")
+                 "_row_bytes", "_row_aligned", "_dir_len")
 
     def __init__(
         self,
@@ -216,6 +219,7 @@ class PackedVectors:
         self.rotation = validate_rotation(rotation)
         self._row_bytes = packed_nbytes(1, d, bits)
         self._row_aligned = (d * bits) % 8 == 0
+        self._dir_len = {}  # precision -> (n,) length of the decoded direction
 
     @property
     def has_norms(self) -> bool:
@@ -634,7 +638,7 @@ class Quantizer:
 
     def __init__(self, d: int, bits: int = 4, seed: int = 42,
                  rotation: str = "haar", normalize: bool = True,
-                 scale: Optional[float] = None):
+                 scale: Optional[float] = None, renorm: bool = True):
         if bits < 1 or bits > 8:
             raise ValueError(f"bits must be 1-4 or 8, got {bits}")
         if bits not in SUPPORTED_BITS:
@@ -667,6 +671,7 @@ class Quantizer:
         self.seed = seed
         self.rotation = rotation
         self.normalize = normalize
+        self.renorm = bool(renorm)
         self.scale = coordinate_sigma(d, sigma)
 
         self.R = self.ROTATIONS[rotation](d, seed)
@@ -803,6 +808,65 @@ class Quantizer:
             f"factor across every coordinate."
         )
 
+    def _direction_lengths(
+        self, compressed, precision: Optional[int] = None
+    ) -> np.ndarray:
+        """L2 length of each decoded direction, ``||u_hat||``.
+
+        The stored norm is the length of the *original* vector, but the
+        direction it multiplies is a quantized one whose own length is not 1
+        -- at 2-bit on real embeddings it runs 0.89-0.97 and varies per
+        vector. This is that length, read straight off the codes: no bytes
+        are stored for it, and none need to be.
+
+        Rotation is orthogonal, so the length is the same in rotated and
+        original space and no unrotate is needed. Cached per precision on the
+        container, because the Matryoshka tables give a different length at
+        every level.
+        """
+        cached = compressed._dir_len.get(precision)
+        if cached is not None:
+            return cached
+
+        centroids = self._resolve_centroids(compressed, precision)
+        sq = np.square(centroids.astype(np.float64))
+
+        if isinstance(compressed, PackedVectors):
+            shift = (
+                0 if (precision is None or precision == self.bits)
+                else (self.bits - precision)
+            )
+            n = compressed.n
+            acc = np.empty(n, dtype=np.float64)
+            for start in range(0, n, 4096):
+                end = min(start + 4096, n)
+                chunk = compressed.unpack_rows(start, end)
+                if shift > 0:
+                    chunk = chunk >> shift
+                acc[start:end] = sq[chunk].sum(axis=1)
+        else:
+            indices = self._resolve_indices(compressed, precision)
+            acc = sq[indices].sum(axis=1)
+
+        lengths = np.sqrt(acc).astype(np.float32)
+        compressed._dir_len[precision] = lengths
+        return lengths
+
+    def _effective_norms(
+        self, compressed, precision: Optional[int] = None
+    ) -> Optional[np.ndarray]:
+        """The scale to multiply a decoded direction by.
+
+        ``norms`` on its own reconstructs a vector of the wrong length;
+        dividing by the decoded direction's length fixes it. Returns
+        ``norms`` unchanged in scalar mode (no norms to correct) and under
+        ``renorm=False``.
+        """
+        if compressed.norms is None or not self.renorm:
+            return compressed.norms
+        lengths = self._direction_lengths(compressed, precision)
+        return compressed.norms / np.maximum(lengths, 1e-12)
+
     def decode(
         self, compressed: CompressedVectors, precision: Optional[int] = None
     ) -> np.ndarray:
@@ -824,7 +888,7 @@ class Quantizer:
         X_hat = self._unrotate_rows(X_hat_rot)
         if compressed.norms is None:  # scalar mode — coordinates are the code
             return X_hat
-        return X_hat * compressed.norms[:, None]
+        return X_hat * self._effective_norms(compressed, precision)[:, None]
 
     def search(
         self,
@@ -866,7 +930,9 @@ class Quantizer:
         q_rot = self._rotate_query(query)
 
         X_hat_rot = self._get_x_hat_rot(compressed, precision)
-        scores = _apply_norms(X_hat_rot @ q_rot, compressed.norms)
+        scores = _apply_norms(
+            X_hat_rot @ q_rot, self._effective_norms(compressed, precision)
+        )
 
         if k >= compressed.n:
             topk_idx = np.argsort(-scores)
@@ -916,12 +982,14 @@ class Quantizer:
         if isinstance(compressed, PackedVectors):
             shift = 0 if (precision is None or precision == self.bits) else (self.bits - precision)
             scores = self._adc_score_packed(
-                table, compressed, shift, chunk_size
+                table, compressed, shift, chunk_size,
+                self._effective_norms(compressed, precision),
             )
         else:
             indices = self._resolve_indices(compressed, precision)
             scores = self._adc_score_chunked(
-                table, indices, compressed.norms, chunk_size
+                table, indices,
+                self._effective_norms(compressed, precision), chunk_size
             )
 
         if k >= compressed.n:
@@ -986,12 +1054,15 @@ class Quantizer:
         if is_packed:
             coarse_shift = self.bits - coarse_precision
             coarse_scores = self._adc_score_packed(
-                coarse_table, compressed, coarse_shift, coarse_chunk_size
+                coarse_table, compressed, coarse_shift, coarse_chunk_size,
+                self._effective_norms(compressed, coarse_precision),
             )
         else:
             coarse_indices = self._resolve_indices(compressed, coarse_precision)
             coarse_scores = self._adc_score_chunked(
-                coarse_table, coarse_indices, compressed.norms, coarse_chunk_size
+                coarse_table, coarse_indices,
+                self._effective_norms(compressed, coarse_precision),
+                coarse_chunk_size
             )
 
         if coarse_k >= compressed.n:
@@ -1008,9 +1079,8 @@ class Quantizer:
 
         X_hat_cand = fine_centroids[fine_indices]  # (candidates, d)
 
-        cand_norms = (
-            None if compressed.norms is None else compressed.norms[coarse_idx]
-        )
+        fine_norms = self._effective_norms(compressed, None)
+        cand_norms = None if fine_norms is None else fine_norms[coarse_idx]
         fine_scores = _apply_norms(X_hat_cand @ q_rot, cand_norms)
         rerank_order = np.argsort(-fine_scores)[:k]
 
@@ -1059,10 +1129,8 @@ class Quantizer:
 
         X_hat_rot = self._get_x_hat_rot(compressed, precision)
         # (n_queries, n) = (n_queries, d) @ (d, n)
-        batch_norms = (
-            None if compressed.norms is None
-            else compressed.norms[np.newaxis, :]
-        )
+        eff = self._effective_norms(compressed, precision)
+        batch_norms = None if eff is None else eff[np.newaxis, :]
         all_scores = _apply_norms(Q_rot @ X_hat_rot.T, batch_norms)
 
         all_indices = np.empty((n_queries, min(k, compressed.n)), dtype=np.intp)
@@ -1137,6 +1205,7 @@ class Quantizer:
         packed: "PackedVectors",
         shift: int,
         chunk_size: int,
+        norms: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Score packed vectors via ADC, unpacking chunks on demand.
 
@@ -1145,6 +1214,10 @@ class Quantizer:
             packed: PackedVectors with bit-packed indices.
             shift: Right-shift to apply for precision reduction (0 = full).
             chunk_size: Rows per chunk (controls peak memory).
+            norms: (n,) scale per vector, or None in scalar mode. Pass
+                ``Quantizer._effective_norms`` so the reconstruction-length
+                correction reaches this path too; defaults to the packed
+                container's own norms.
 
         Returns:
             (n,) float32 approximate inner-product scores.
@@ -1153,6 +1226,7 @@ class Quantizer:
         d = table.shape[0]
         dim_idx = np.arange(d)
         scores = np.empty(n, dtype=np.float32)
+        scale = packed.norms if norms is None else norms
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
@@ -1160,9 +1234,7 @@ class Quantizer:
             if shift > 0:
                 chunk_idx = chunk_idx >> shift
             chunk_scores = table[dim_idx, chunk_idx].sum(axis=1)
-            chunk_norms = (
-                None if packed.norms is None else packed.norms[start:end]
-            )
+            chunk_norms = None if scale is None else scale[start:end]
             scores[start:end] = _apply_norms(chunk_scores, chunk_norms)
 
         return scores
