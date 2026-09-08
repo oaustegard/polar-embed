@@ -360,6 +360,7 @@ class GPUSearcher:
             self._x_hat_rot_gpu = self._build_x_hat_rot()
 
         scores = self._scale(ops.matvec(self._x_hat_rot_gpu, q_rot))
+        scores = scores + self._query_offset(query)
         idx, vals = ops.topk(scores, k)
         return ops.to_numpy(idx), ops.to_numpy(vals)
 
@@ -390,6 +391,7 @@ class GPUSearcher:
             ops.gather_sum(table, indices, chunk_size=chunk_size),
             precision=precision,
         )
+        scores = scores + self._query_offset(query)
         idx, vals = ops.topk(scores, k)
         return ops.to_numpy(idx), ops.to_numpy(vals)
 
@@ -437,7 +439,7 @@ class GPUSearcher:
 
         fine_scores = self._scale(
             ops.matvec(X_hat_cand, q_rot), rows=coarse_idx
-        )
+        ) + self._query_offset(query)
         rerank_idx, rerank_scores = ops.topk(fine_scores, k)
 
         original_idx = coarse_idx[rerank_idx]
@@ -469,6 +471,10 @@ class GPUSearcher:
 
         # (n_queries, n) = (n_queries, d) @ (n, d).T
         all_scores = self._scale(ops.matmul(Q_rot, self._x_hat_rot_gpu.T))
+        if self._pq.mean is not None:
+            all_scores = all_scores + ops.to_device(
+                (np.asarray(queries, dtype=np.float32) @ self._pq.mean)[:, None]
+            )
 
         n_queries = Q.shape[0]
         actual_k = min(k, self._n)
@@ -504,6 +510,14 @@ class GPUSearcher:
                 np.asarray(host, dtype=np.float32)
             )
         return self._norm_cache[precision]
+
+    def _query_offset(self, query):
+        """``q . mu`` for a centred index, 0.0 otherwise.
+
+        Constant across the corpus for a given query, so it cannot
+        reorder; added so GPU scores match ``Quantizer.search``.
+        """
+        return self._pq._query_offset(query)
 
     def _scale(self, scores, rows=None, precision=None):
         """Rescale raw quantized scores by the effective norms, if any.

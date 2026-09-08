@@ -4,7 +4,7 @@
 
 **remex** (formerly polar-embed) is a Python library for retrieval-validated embedding compression. It implements random orthogonal rotation + Lloyd-Max scalar quantization (from TurboQuant, Zandieh et al. ICLR 2026) to compress embedding vectors 2-16x with measured recall, optimized for nearest-neighbor retrieval in RAG systems.
 
-Key differentiator: **data-oblivious** — no training required. The codes a quantizer writes are fully determined by `(dimension, bits, seed, rotation, normalize, scale)`. `renorm` is a seventh constructor argument but deliberately not part of that tuple: it changes how codes are read, not what they are.
+Key differentiator: **data-oblivious** — no training required. The codes a quantizer writes are fully determined by `(dimension, bits, seed, rotation, normalize, scale)`, with one opt-in exception: `mean` (see design decision 4). `renorm` is a further constructor argument but deliberately not part of that tuple: it changes how codes are read, not what they are. `renorm` is a seventh constructor argument but deliberately not part of that tuple: it changes how codes are read, not what they are.
 
 ## Architecture
 
@@ -26,12 +26,14 @@ tests/
 ├── test_packed_vectors.py # PackedVectors creation, unpacking, ADC, serialization
 ├── test_coverage_gaps.py  # Edge cases, save/load all bits, subset search
 ├── test_scalar_mode.py   # normalize=False: hash-key properties, rotation="none", mode guard
-└── test_norm_correction.py # renorm: decoded length, per-precision, path agreement, recall
+├── test_norm_correction.py # renorm: decoded length, per-precision, path agreement, recall
+└── test_centered_mode.py   # mean=: length restoration, guards, path agreement, npz
 
 bench/
 ├── benchmark.py          # Self-contained benchmark (no external deps)
 ├── real_embedding_eval.py  # Real embeddings benchmark (needs sentence-transformers, faiss)
 ├── norm_correction_eval.py # renorm off/on: cluster-spread sweep + cached SPECTER2
+├── centered_eval.py        # mean= off/on, plus the naive arm that loses recall
 └── RESULTS.md            # Benchmark results with distribution sensitivity analysis
 ```
 
@@ -100,6 +102,7 @@ python bench/benchmark.py               # synthetic data, no extra deps
 pip install -e ".[bench]"               # for real embedding benchmarks
 python bench/real_embedding_eval.py     # needs sentence-transformers + faiss-cpu
 python bench/norm_correction_eval.py    # renorm off/on; add --specter2 for the cache
+python bench/centered_eval.py           # mean= off/on; add --specter2 for the cache
 
 # SPECTER2 (allenai/specter2_base, d=768) — encoding the transformer takes
 # ~50 min on CPU per 10k papers. Skip the encode by pulling a precomputed
@@ -139,9 +142,17 @@ python bench/specter2_eval.py --cached  # then run the bench against the cache
    - **It is per precision.** A Matryoshka level has its own centroid table and therefore its own direction lengths; the cache on the container is keyed by precision for that reason.
    - **The Mojo port does not implement it yet.** `mojo/src/quantizer.mojo` still multiplies raw `norms`, so `polarquant` search diverges from Python search. `.pq` encode parity is unaffected — the codes are identical.
 
-4. **ADC for memory efficiency** — The lookup table `(d, 2^bits)` is tiny (~6KB for 2-bit d=384). Chunked scoring keeps temporary allocation at ~6MB regardless of corpus size.
+4. **Centered mode (`mean=`, opt-in)** — encodes `x - mu` and solves at encode time for the stored length `m` such that `||mu + m*u_hat|| == ||x||`. That keeps the whole correction in the norms column, so a centered index costs no per-vector bytes; `_centred_lengths` does the quadratic. The two halves are inseparable: centering with the residual's own length loses 0.03-0.18 R@10, which `bench/centered_eval.py`'s naive column shows.
 
-5. **GPU is a wrapper, not a fork** — `GPUSearcher` wraps `Quantizer + CompressedVectors` rather than replacing them. The core stays pure NumPy.
+   - **The mean is caller-declared, never measured.** `remex.corpus_mean(X)` computes one, but `Quantizer` will not call it for you — same contract as `scale` in scalar mode, and what keeps "no training" honest.
+   - **It is part of the encoding.** Containers carry it, `_check_mean` runs from `_resolve_centroids` like `_check_rotation`, and a mismatch raises rather than returning vectors shifted by the difference.
+   - **Every scoring path needs `_query_offset`.** `q . mu` is constant across the corpus so it cannot reorder, but it must be added for scores to match `decode()`. `core.py`, `ivf.py` and `gpu.py` all do; `tests/test_centered_mode.py::TestIvfAndGpuAgree` is what makes a missed path loud, and it was verified to go red with the offsets removed.
+   - **`.pq` refuses a centered container** — the format has no section for the mean, and a reader that dropped it would decode every vector shifted. `.npz` and Arrow round-trip it. The Mojo port is untouched for the same reason.
+   - **Gain is corpus-dependent**, predicted by `||mean|| / mean ||x||`: 0.92 on SPECTER2 (+0.03 to +0.08 R@10), 0.51 on all-MiniLM-L6-v2 (+0.005 to +0.018), 0.01 on isotropic Gaussian (nothing). Not a default.
+
+5. **ADC for memory efficiency** — The lookup table `(d, 2^bits)` is tiny (~6KB for 2-bit d=384). Chunked scoring keeps temporary allocation at ~6MB regardless of corpus size.
+
+6. **GPU is a wrapper, not a fork** — `GPUSearcher` wraps `Quantizer + CompressedVectors` rather than replacing them. The core stays pure NumPy.
 
 ## Testing
 

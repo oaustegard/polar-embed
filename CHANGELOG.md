@@ -4,6 +4,46 @@
 
 ### Added
 
+- **Centered mode — `Quantizer(..., mean=...)`, opt-in**
+  ([#81](https://github.com/oaustegard/remex/issues/81)). Encodes each
+  vector's offset from a corpus mean the caller supplies, and solves at
+  encode time for the stored length `m` such that `‖mu + m·u_hat‖ = ‖x‖`.
+  Putting the correction in the norms column the container already has means
+  a centered index costs no extra bytes per vector — only the one stored
+  mean, `d × 4` bytes for the whole index.
+
+  Both halves are one feature. Subtracting a mean and keeping the residual's
+  own length loses 0.03 to 0.18 R@10 at every bit width measured;
+  `bench/centered_eval.py` reports that naive arm alongside the real one.
+
+  R@10, plain → centered:
+
+  | corpus | ‖mean‖ / mean ‖x‖ | 1-bit | 2-bit | 4-bit |
+  |---|---|---|---|---|
+  | SPECTER2 broad, 9.5k | 0.92 | 0.637 → 0.686 | 0.773 → 0.852 | 0.917 → 0.949 |
+  | SPECTER2 narrow, 9.5k | 0.92 | 0.670 → 0.706 | 0.789 → 0.858 | 0.922 → 0.958 |
+  | all-MiniLM-L6-v2, 10k | 0.51 | 0.635 → 0.609 | 0.759 → 0.777 | 0.919 → 0.924 |
+  | synthetic gaussian, 9.5k | 0.01 | 0.258 → 0.254 | 0.540 → 0.542 | 0.860 → 0.858 |
+
+  The second column predicts the gain, and it is why this is opt-in rather
+  than a default: near zero, centering does nothing, and at 1-bit on MiniLM
+  it costs 0.026.
+
+  remex never measures the mean. `remex.corpus_mean(X)` computes one and the
+  caller passes it, the same contract `scale` has in scalar mode, which is
+  what keeps the data-oblivious claim honest. The mean is part of the
+  encoding: every container records it, and `_check_mean` refuses codes
+  written against a different one the way `_check_rotation` already refuses a
+  different rotation.
+
+- **`remex.corpus_mean(X)`** — float64 accumulation, float32 result, so the
+  value does not depend on how the rows were chunked.
+
+- **`bench/centered_eval.py`** — plain, centered and naive-centered arms
+  across synthetic, MiniLM and (under `--specter2`) the cached SPECTER2
+  partitions. Prints `‖mean‖ / mean ‖x‖` next to the recall so the decision
+  is visible before the sweep.
+
 - **Reconstruction-length correction — `Quantizer(..., renorm=True)`, on by
   default** ([#81](https://github.com/oaustegard/remex/issues/81)). remex
   stores each vector's exact norm and a quantized unit direction, then
@@ -70,6 +110,15 @@
 - **`has_norms`** on `CompressedVectors` / `PackedVectors`.
 
 ### Changed
+
+- **`IVFCoarseIndex` and `GPUSearcher` scoring add `Quantizer._query_offset`.**
+  `q · mu` is constant across the corpus and cannot reorder, but it has to be
+  added for their scores to match `Quantizer.search`.
+  `tests/test_centered_mode.py::TestIvfAndGpuAgree` covers both, and was
+  verified to fail with the offsets removed.
+- **`save_pq` raises on a centered container.** The `.pq` format has no
+  section for the mean, and a reader that dropped it would decode every
+  vector shifted. `.npz` and Arrow round-trip it.
 
 - **`GPUSearcher._scale` takes a `precision` argument** and resolves norms
   through `Quantizer._effective_norms`, cached per precision on device.
